@@ -7,7 +7,7 @@ Reports, for the stock forward and for the two restructured variants:
   3. traffic of the *assembly* ops only (cat / interpolate / grid_sample)
   4. number of aten dispatches (= kernel launches, the launch-overhead proxy)
 
-Usage: uv run python -m rife_fast.model_cost [--h 720] [--w 1280] [--mode pyramid]
+Usage: uv run python -m src.model_cost [--h 720] [--w 1280] [--mode pyramid]
 """
 import argparse
 import os
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.flop_counter import FlopCounterMode
 
-from rife_fast.net import load_flownet  # noqa: E402
+from src.net import load_flownet  # noqa: E402
 
 
 def main():

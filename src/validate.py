@@ -9,7 +9,7 @@ Runs on CPU or CUDA and compares the fast paths against the stock forward:
   fold     folded beta vs. unfolded                          (>=80 dB)
   batch    batched vs. per-sample loop
 
-Usage:  uv run python -m rife_fast.validate
+Usage:  uv run python -m src.validate
 """
 import os
 import time
@@ -18,9 +18,9 @@ import cv2
 import numpy as np
 import torch
 
-from rife_fast import ROOT
-from rife_fast.net import interp, load_flownet, warp  # noqa: E402
-from rife_fast.warplayer import warp as warp_ref  # noqa: E402
+from src import ROOT
+from src.net import interp, load_flownet, warp  # noqa: E402
+from src.warplayer import warp as warp_ref  # noqa: E402
 
 
 def stock_inference(ifnet, img0, img1, timestep=0.5, scale=1.0):

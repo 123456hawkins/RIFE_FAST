@@ -1,9 +1,9 @@
 """Measure every optimisation on *your* GPU, one variable at a time.
 
-    uv run python -m rife_fast.bench_gpu                 # 720p, 2x
-    uv run python -m rife_fast.bench_gpu -m 8            # 8x (7 timesteps/pair)
-    uv run python -m rife_fast.bench_gpu --compile       # include torch.compile
-    uv run python -m rife_fast.bench_gpu --psnr          # + quality check
+    uv run python -m src.bench_gpu                 # 720p, 2x
+    uv run python -m src.bench_gpu -m 8            # 8x (7 timesteps/pair)
+    uv run python -m src.bench_gpu --compile       # include torch.compile
+    uv run python -m src.bench_gpu --psnr          # + quality check
 
 Columns:
     ms/pair   wall time per input frame pair (multi-1 frames produced)
@@ -19,8 +19,8 @@ import time
 
 import torch
 
-from rife_fast import MODELS, ROOT
-from rife_fast.net import load_flownet  # noqa: E402
+from src import MODELS, ROOT
+from src.net import load_flownet  # noqa: E402
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_grad_enabled(False)
@@ -84,7 +84,7 @@ def main():
     print(f"{'config':44s} {'ms/pair':>9s} {'pairs/s':>9s} {'out-fps':>9s} {'x':>6s}")
 
     # ---- stock model (raw IFNet, i.e. what RIFE_HDv3.Model wraps) --------
-    from rife_fast.weights import load_ifnet_class
+    from src.weights import load_ifnet_class
     stock = load_ifnet_class()()
     _sd = torch.load(str(MODELS / "flownet.pkl"), map_location="cpu")
     _own = stock.state_dict()
@@ -113,7 +113,7 @@ def main():
     dt = timeit(lambda: orig(x0, x1, m - 1), args.iters)
     report(f"orig fp32 eager (stock) multi={m}", dt)
 
-    from rife_fast import warplayer as _wp
+    from src import warplayer as _wp
     _wp.backwarp_tenGrid.clear()  # cache is keyed by shape only
     torch.set_default_dtype(torch.float16)  # what --fp16 does in the stock script
     stock.half()

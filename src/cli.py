@@ -3,9 +3,9 @@
 
 日常只需要：输入、输出、倍率，偶尔加 --codec / --quality。
 
-    python -m rife_fast -i in.mp4 -m 2 -o out.mp4              # 默认（最快）
-    python -m rife_fast -i in.mp4 -m 2 --codec h265 --quality 28   # 更小
-    python -m rife_fast -i in.mp4 -m 4 -o out4x.mp4
+    python -m src -i in.mp4 -m 2 -o out.mp4              # 默认（最快）
+    python -m src -i in.mp4 -m 2 --codec h265 --quality 28   # 更小
+    python -m src -i in.mp4 -m 4 -o out4x.mp4
 
 想更快：加 `--trt-engine auto`（首次会自动构建引擎，约 2 分钟）。
 其余参数都在"高级参数"里，一般不用动。详见 README.md。
@@ -29,8 +29,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import torch.nn.functional as F
 
-from rife_fast import ENGINES
-from rife_fast.net import load_flownet  # noqa: E402
+from src import ENGINES
+from src.net import load_flownet  # noqa: E402
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -447,13 +447,13 @@ def bench(args):
 def ensure_engine(args, batch, h, w, ph, pw):
     """--trt-engine auto: one engine per (resolution, batch), built on demand."""
     os.makedirs(ENGINES, exist_ok=True)
-    from rife_fast.engine import engine_name
+    from src.engine import engine_name
     name = os.path.join(str(ENGINES), engine_name(pw, ph, batch))
     if os.path.exists(name):
         return name
     if not torch.cuda.is_available():
         sys.exit("--trt-engine auto needs CUDA")
-    from rife_fast.engine import build, export
+    from src.engine import build, export
     print(f"[trt] {name} not found, exporting + building "
           f"({pw}x{ph}, batch {batch}, ~2 min)")
     onnx = name.replace(".engine", ".onnx")
@@ -478,7 +478,7 @@ def run_video(args):
     if args.trt_engine == "auto":
         args.trt_engine = ensure_engine(args, K * len(ts), h, w, ph, pw)
     if args.trt_engine:
-        from rife_fast.engine import TRTNet
+        from src.engine import TRTNet
         net = TRTNet(args.trt_engine, (K * len(ts), 6, ph, pw))
         head_cache = False  # the encoder lives inside the engine
         print(f"TensorRT engine: {args.trt_engine}")

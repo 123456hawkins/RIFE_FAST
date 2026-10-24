@@ -1,6 +1,6 @@
 """Per-frame PSNR between two PNG directories.
 
-    python -m rife_fast.compare_pngs dir_a dir_b
+    python -m src.compare_pngs dir_a dir_b
 """
 import os
 import sys

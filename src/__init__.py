@@ -1,11 +1,11 @@
-"""rife_fast — fast RIFE frame-interpolation pipeline (CUDA + TensorRT).
+"""Fast RIFE frame-interpolation pipeline (CUDA + TensorRT).
 
 Layout (src layout, so ``pip install -e .`` works):
 
     RIFE_FAST/
       models/     flownet.pkl (+ optional IFNet_HDv3.py override)   [git-ignored]
       engines/    TensorRT engines, one per (W, H, batch, weights)  [git-ignored]
-      rife_fast/  the package
+      src/        the package
 """
 from __future__ import annotations
 

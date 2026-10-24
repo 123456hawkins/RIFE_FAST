@@ -82,8 +82,8 @@ uv run rife-fast -i in.mp4 -m 8 -o out8x.mp4
 uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o small.mp4
 ```
 
-`uv run rife-fast` 与 `uv run python -m rife_fast` 等价；如果你已 `uv sync`，
-也可以在 `.venv` 激活后用 `python -m rife_fast`。
+`uv run rife-fast` 与 `uv run python -m src` 等价；如果你已 `uv sync`，
+也可以在 `.venv` 激活后用 `python -m src`。
 
 ---
 
@@ -156,7 +156,7 @@ RIFE_FAST/
 ├── models/            # flownet.pkl（自己下载，git 忽略）
 ├── engines/           # TensorRT 引擎（自动生成，git 忽略）
 ├── assets/            # 自检用的两张示例图
-├── rife_fast/
+├── src/
 │   ├── cli.py         # 命令行入口
 │   ├── net.py         # 前向实现（ref / assemble / pyramid 三档）
 │   ├── engine.py      # ONNX 导出 / 引擎构建 / TRT 运行时
@@ -189,7 +189,7 @@ cp new/flownet.pkl models/flownet.pkl
 #    若该版本改了网络结构，把它的 IFNet_HDv3.py 也放进 models/
 
 # 2) 自检（30 秒，必跑）
-uv run python -m rife_fast.validate
+uv run python -m src.validate
 ```
 
 四个判据：
@@ -202,7 +202,7 @@ uv run python -m rife_fast.validate
 | `[fold]` | ≥ 80 dB | beta 折叠的数值代价 |
 
 `[assemble]` 若掉到 40 dB 量级 → 新版本改了前向结构，请先用 `--mode ref`，
-再改 `rife_fast/net.py` 的对应分支。
+再改 `src/net.py` 的对应分支。
 
 ```bash
 # 3) 直接跑，引擎自动重建（720p≈2min / 1080p≈4min）
@@ -242,12 +242,12 @@ TensorRT 已经是必需依赖，不需要时可从 `pyproject.toml` 删掉。
 ## 7. 开发工具
 
 ```bash
-uv run python -m rife_fast.validate           # 换权重必跑
-uv run python -m rife_fast.tools.bench_gpu    # 各配置逐项对比
-uv run python -m rife_fast.tools.profile_gpu  # kernel 级瓶颈
-uv run python -m rife_fast.tools.model_cost   # FLOPs/访存成本模型
-uv run python -m rife_fast.tools.quality      # 画质 A/B
-uv run python -m rife_fast.tools.compare_videos a.mp4 b.mp4 1280 720
+uv run python -m src.validate           # 换权重必跑
+uv run python -m src.tools.bench_gpu    # 各配置逐项对比
+uv run python -m src.tools.profile_gpu  # kernel 级瓶颈
+uv run python -m src.tools.model_cost   # FLOPs/访存成本模型
+uv run python -m src.tools.quality      # 画质 A/B
+uv run python -m src.tools.compare_videos a.mp4 b.mp4 1280 720
 ```
 
 环境变量 `RIFE_STATS=1` 会打印流水线分段计时（read/pin/h2d/fwd/bufwait）。

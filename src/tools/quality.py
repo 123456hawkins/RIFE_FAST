@@ -1,6 +1,6 @@
 """Quality A/B: stock forward vs the net.py modes (device-agnostic).
 
-    python -m rife_fast.quality
+    python -m src.quality
 """
 import os
 
@@ -9,8 +9,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from rife_fast import MODELS, ROOT
-from rife_fast.net import load_flownet  # noqa: E402
+from src import MODELS, ROOT
+from src.net import load_flownet  # noqa: E402
 
 torch.set_grad_enabled(False)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -35,7 +35,7 @@ def main():
                    (0, PW - W, 0, PH - H))
         i1 = F.pad(rd(os.path.join(ROOT, "demo/I0_1.png"), (W, H)).to(DEV),
                    (0, PW - W, 0, PH - H))
-        from rife_fast.weights import load_ifnet_class
+        from src.weights import load_ifnet_class
         m = load_ifnet_class()()
         _sd = torch.load(str(MODELS / "flownet.pkl"), map_location="cpu")
         _own = m.state_dict()

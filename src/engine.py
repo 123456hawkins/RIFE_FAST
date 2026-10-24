@@ -12,9 +12,9 @@ and no custom plugin is needed.  What TRT buys us over PyTorch eager:
 Usage
 -----
     pip install tensorrt onnx            # onnx only needed for export
-    uv run python -m rife_fast.engine export --h 720 --w 1280 --batch 4
-    uv run python -m rife_fast.engine build  --onnx rife_720p_b4.onnx --engine rife.engine
-    uv run python -m rife_fast.engine bench  --engine rife.engine --h 720 --w 1280 --batch 4
+    uv run python -m src.engine export --h 720 --w 1280 --batch 4
+    uv run python -m src.engine build  --onnx rife_720p_b4.onnx --engine rife.engine
+    uv run python -m src.engine bench  --engine rife.engine --h 720 --w 1280 --batch 4
 
     # then the normal video pipeline, but with the engine:
     uv run rife-fast -i in.mp4 -m 2 \
@@ -38,8 +38,8 @@ import time
 
 import torch
 
-from rife_fast import ENGINES, MODELS
-from rife_fast.net import IFNetFast, load_flownet  # noqa: E402
+from src import ENGINES, MODELS
+from src.net import IFNetFast, load_flownet  # noqa: E402
 
 
 def weights_tag() -> str:

@@ -345,14 +345,14 @@ def load_flownet(model_dir: str | None = None, device=None, fp16: bool = False,
                  mode: str = "pyramid", fold: bool = True):
     """Load ``flownet.pkl`` into a fresh IFNet and wrap it with IFNetFast.
 
-    ``train_log_dir`` defaults to ``rife_fast/weights``; pass a path to use a
+    ``train_log_dir`` defaults to ``src/weights``; pass a path to use a
     checkpoint that lives elsewhere (e.g. the upstream ``train_log/``).
     """
 
     import torch
 
-    from rife_fast import MODELS
-    from rife_fast.weights import load_ifnet_class
+    from src import MODELS
+    from src.weights import load_ifnet_class
 
     model_dir = model_dir or str(MODELS)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -1,6 +1,6 @@
 """Per-frame PSNR between two videos.
 
-    python -m rife_fast.compare_videos A.mp4 B.mp4 1280 720
+    python -m src.compare_videos A.mp4 B.mp4 1280 720
 """
 import subprocess
 import sys
