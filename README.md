@@ -57,7 +57,7 @@ models/
 
 ```bash
 uv sync               # torch + TensorRT + ONNX + numpy + tqdm
-uv sync --extra png   # 额外装 opencv（只有 --png 输出和 PNG 对比工具需要）
+uv sync --extra png   # 额外装 opencv（validate / 画质对比等开发工具需要）
 ```
 
 TensorRT 通过 pip 安装（`tensorrt` 包自带 CUDA 库），不需要另外装 NVIDIA 的 tarball。
@@ -68,19 +68,26 @@ TensorRT 通过 pip 安装（`tensorrt` 包自带 CUDA 库），不需要另外�
 ## 2. 快速开始
 
 ```bash
-# 720p 2x —— 默认就是实测最快的配置
-uv run rife-fast -i in.mp4 -m 2 -o out.mp4
+# 720p 2x —— 默认就是实测最快的配置；输出到 out/in_2X.mp4
+uv run rife-fast -i in.mp4 -m 2 -o out
+
+# 多文件排队：按给出顺序逐个处理，输出到同一个文件夹
+uv run rife-fast -i a.mp4 b.mp4 c.mp4 -m 2 -o out
+uv run rife-fast -i a.mp4 -i b.mp4 -m 2 -o out      # 等价写法
 
 # 加上 TensorRT（再快 ~20%）
-uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out.mp4
+uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 
 # 4x / 8x
-uv run rife-fast -i in.mp4 -m 4 -o out4x.mp4
-uv run rife-fast -i in.mp4 -m 8 -o out8x.mp4
+uv run rife-fast -i in.mp4 -m 4 -o out              # out/in_4X.mp4
+uv run rife-fast -i in.mp4 -m 8 -o out              # out/in_8X.mp4
 
 # 更小的文件
-uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o small.mp4
+uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o out
 ```
+
+`-o` 是**输出文件夹**（默认当前目录），文件名自动追加倍率标志：
+`in.mp4` + `-m 2` → `in_2X.mp4`。
 
 `uv run rife-fast` 与 `uv run python -m src` 等价；如果你已 `uv sync`，
 也可以在 `.venv` 激活后用 `python -m src`。
@@ -93,15 +100,12 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o small.mp4
 
 | 参数 | 说明 |
 |------|------|
-| `-i, --input` | 输入视频（必填） |
-| `-o, --output` | 输出视频；默认 `输入名_2X_48fps.mp4` |
-| `-m, --multi` | 倍率 2/4/8（`--exp 3` 等价于 `-m 8`） |
+| `-i, --input` | 输入视频（必填）；可给多个，按顺序排队处理 |
+| `-o, --output` | **输出文件夹**（默认当前目录）；文件名自动加 `_2X`/`_4X` 标志 |
+| `-m, --multi` | 倍率 2/4/8（`--exp 3` 等价于 `-m 8`）；输出帧率 = 源帧率 × 倍率 |
 | `--codec` | `auto`（默认）：≤1080p 用 h264，>1080p 用 h265。也可强制 `h264`/`h265`/`x264`/`x265` |
 | `--quality`（别名 `--cq`） | 画质档 18–30，越小越清晰、文件越大。默认 **22** |
-| `--bitrate 4M` | 改用固定码率（放弃按画质） |
-| `--fps` | 输出帧率，默认 源帧率 × 倍率 |
 | `--trt-engine auto` | 用 TensorRT，按分辨率/批次/权重自动找或建引擎 |
-| `--png` | 输出 PNG 序列而不是视频 |
 | `--no-audio` | 不合并音轨 |
 
 ### 3.2 高级参数（一般不用动）
@@ -206,7 +210,7 @@ uv run python -m src.validate
 
 ```bash
 # 3) 直接跑，引擎自动重建（720p≈2min / 1080p≈4min）
-uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out.mp4
+uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 ```
 
 ---
@@ -218,7 +222,7 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out.mp4
 
 **Q: 输出文件太大？**
 默认 `--quality 22` 约 6 Mbps。改用 `--quality 26`（约 −32% 体积）或
-`--bitrate 4M`。结束时会打印实际码率，超过源码率 1.8 倍还会告警。
+`--quality 30`。结束时会打印实际码率。
 
 **Q: 显存不够？**
 2K 用 `--batch-pairs 2`，4K 用 `--scale 0.5`。720p 峰值约 1.2 GiB。
@@ -227,15 +231,16 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out.mp4
 要，引擎绑定 `(W, H, batch)`。用 `--trt-engine auto` 会自动处理。
 注意**改 `--batch-pairs` 也会触发重建**。
 
+**Q: 多文件排队时会重复加载模型吗？**
+不会。同一分辨率/批次会复用模型、TRT 引擎和 CUDA Graph；
+只有分辨率或批次变化时才重建（显存只保留当前一份）。
+
 **Q: 为什么 4x/8x 的输出 fps 和 2x 差不多？**
 流水线受"输出帧数"限制（编码器/IO），不是帧对数。倍率越高帧对/s 按比例下降。
 
 **Q: 能不能不用 TensorRT？**
 可以，不加 `--trt-engine auto` 就走 PyTorch（fp16 + CUDA Graph），慢约 25%。
 TensorRT 已经是必需依赖，不需要时可从 `pyproject.toml` 删掉。
-
-**Q: `--png` 报缺 cv2？**
-`uv sync --extra png`。
 
 ---
 

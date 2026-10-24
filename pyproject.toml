@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# only for --png output and the PNG comparison tool
+# dev tools only (validate.py, quality.py, compare_pngs.py)
 png = ["opencv-python>=4.8"]
 
 [project.scripts]

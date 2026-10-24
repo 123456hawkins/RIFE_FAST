@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Fast RIFE interpolation CLI (720p / 1080p / 2K, RTX 30/40).
 
-日常只需要：输入、输出、倍率，偶尔加 --codec / --quality。
+日常只需要：输入、输出文件夹、倍率，偶尔加 --codec / --quality。
 
-    python -m src -i in.mp4 -m 2 -o out.mp4              # 默认（最快）
-    python -m src -i in.mp4 -m 2 --codec h265 --quality 28   # 更小
-    python -m src -i in.mp4 -m 4 -o out4x.mp4
+    python -m src -i in.mp4 -m 2 -o out/               # out/in_2X.mp4
+    python -m src -i a.mp4 b.mp4 -m 2 -o out/          # 多文件排队处理
+    python -m src -i in.mp4 -m 2 --codec h265 --quality 28 -o out/
+    python -m src -i in.mp4 -m 4 -o out/               # out/in_4X.mp4
 
 想更快：加 `--trt-engine auto`（首次会自动构建引擎，约 2 分钟）。
 其余参数都在"高级参数"里，一般不用动。详见 README.md。
@@ -68,7 +69,7 @@ def pad_size(h, w, mult=64):
 
 def ffprobe(path):
     if not os.path.exists(path):
-        sys.exit(f"input not found: {path}")
+        raise RuntimeError(f"input not found: {path}")
     try:
         out = subprocess.check_output(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
@@ -76,9 +77,10 @@ def ffprobe(path):
             stderr=subprocess.PIPE,
         ).decode()
     except subprocess.CalledProcessError as e:
-        sys.exit(f"ffprobe failed on {path}: {e.stderr.decode().strip()}")
+        raise RuntimeError(
+            f"ffprobe failed on {path}: {e.stderr.decode().strip()}") from e
     if '"streams"' not in out:
-        sys.exit(f"no video stream in {path}")
+        raise RuntimeError(f"no video stream in {path}")
     st = json.loads(out)["streams"][0]
     w, h = int(st["width"]), int(st["height"])
     rate = st.get("r_frame_rate", "0/0")
@@ -102,16 +104,6 @@ def ffprobe_frames(path, fps):
         return int(round(dur * fps)) if dur > 0 else None
     except Exception:
         return None
-
-
-def ffprobe_bitrate(path):
-    try:
-        out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-show_entries", "format=bit_rate",
-             "-of", "csv=p=0", path]).decode().strip()
-        return float(out) if out and out != "N/A" else 0.0
-    except (subprocess.CalledProcessError, ValueError):
-        return 0.0
 
 
 def has_audio(path):
@@ -152,17 +144,14 @@ class FrameReader(threading.Thread):
 
 
 class FrameWriter(threading.Thread):
-    """Encode chunks of HWC uint8 frames with ffmpeg, or dump PNGs."""
+    """Encode chunks of HWC uint8 frames with ffmpeg."""
 
     def __init__(self, path, w, h, fps, q, pix_fmt="rgb24", venc_args=None,
-                 png_dir=None, null=False):
+                 null=False):
         super().__init__(daemon=True)
-        self.q, self.png_dir, self.written = q, png_dir, 0
+        self.q, self.written = q, 0
         self.proc = None
         self.null = null                # measure the pipeline, encode nothing
-        if png_dir:
-            os.makedirs(png_dir, exist_ok=True)
-            return
         if self.null:
             return
         v = venc_args or ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20"]
@@ -180,7 +169,6 @@ class FrameWriter(threading.Thread):
                                      bufsize=int(w * h * bpp * 4))
 
     def run(self):
-        import cv2
         while True:
             chunk = self.q.get()
             if chunk is None:
@@ -195,11 +183,6 @@ class FrameWriter(threading.Thread):
                 free = (slot, pool)
             if self.null:
                 self.written += len(chunk)
-            elif self.png_dir:
-                for fr in chunk:
-                    cv2.imwrite(os.path.join(self.png_dir, f"{self.written:07d}.png"),
-                                fr[:, :, ::-1])
-                    self.written += 1
             else:
                 _t = time.perf_counter()
                 self.proc.stdin.write(memoryview(np.ascontiguousarray(chunk)))
@@ -220,10 +203,10 @@ class FrameWriter(threading.Thread):
 def video_encoder_args(args, w=None, h=None):
     """ffmpeg -c:v ... for the chosen codec.
 
-    Notes on the NVENC rate control: ``-cq`` is *not* x264's CRF.  ``-tune ll``
-    disables B-frames and lookahead (fine for streaming, expensive for files);
-    ``-cq 18`` on noisy 720p can easily hit 20+ Mbit/s.  For files use
-    ``-tune hq`` + B-frames + ``-cq 24..26``, and AQ for dark/flat areas.
+    Quality is always controlled by ``--quality`` (CRF for x264/x265,
+    constant-QP for NVENC), never by a fixed bitrate.  ``-cq`` is *not* x264's
+    CRF, but constant-QP still gives a predictable quality/size trade-off and
+    avoids the rate-control overhead of VBR (~2% faster).
     """
     codec = args.codec
     if codec == "auto":
@@ -243,30 +226,16 @@ def video_encoder_args(args, w=None, h=None):
     preset = args.nvenc_preset or ("p3" if is_hevc else "p1")
     tune = args.tune or ("hq" if is_hevc else "ull")
     bf = args.nvenc_bf if args.nvenc_bf is not None else (3 if is_hevc else 0)
-    br = str(args.bitrate)
-    if br not in ("0", "0k", "0K"):
-        # predictable file size: VBR with a target + a cap
-        mbps = _parse_rate(br)
-        v = ["-c:v", enc, "-preset", preset, "-tune", tune,
-             "-rc", "vbr", "-b:v", br, "-maxrate", f"{int(mbps*1.5)}M",
-             "-bufsize", f"{int(mbps*3)}M", "-bf", str(bf)]
-    else:
-        # constqp = true constant quality (no rate-control overhead, ~2% faster),
-        # long GOP + no scenecut = fewer expensive IDR frames
-        v = ["-c:v", enc, "-preset", preset, "-tune", tune,
-             "-rc", "constqp", "-qp", str(args.cq), "-bf", str(bf),
-             "-g", "600", "-no-scenecut", "1", "-multipass", "0"]
+    # constqp = true constant quality (no rate-control overhead, ~2% faster),
+    # long GOP + no scenecut = fewer expensive IDR frames
+    v = ["-c:v", enc, "-preset", preset, "-tune", tune,
+         "-rc", "constqp", "-qp", str(args.cq), "-bf", str(bf),
+         "-g", "600", "-no-scenecut", "1", "-multipass", "0"]
     if tune == "hq":   # lookahead/AQ cost speed; only for the quality preset
         v += ["-rc-lookahead", "20", "-spatial_aq", "1", "-temporal_aq", "1"]
     if is_hevc:
         v += ["-tag:v", "hvc1"]
     return v
-
-
-def _parse_rate(s):
-    s = str(s).strip()
-    mult = {"k": 1e-3, "K": 1e-3, "m": 1.0, "M": 1.0}.get(s[-1], None)
-    return float(s[:-1]) * mult if mult else float(s) / 1e6
 
 
 def build_net(args):
@@ -462,58 +431,130 @@ def ensure_engine(args, batch, h, w, ph, pw):
     return name
 
 
-def run_video(args):
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".flv", ".ts"}
+
+
+def output_name(input_path, multi):
+    """``a/b/clip.mp4`` -> ``clip_2X.mp4`` (the marker is the only suffix)."""
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    return f"{stem}_{multi}X.mp4"
+
+
+def plan_jobs(args):
+    """Validate the queue and map every input to its output file."""
+    inputs = [os.path.abspath(os.path.expanduser(p)) for p in args.input]
+    for p in inputs:
+        if not os.path.isfile(p):
+            sys.exit(f"input not found: {p}")
+    out_dir = os.path.abspath(os.path.expanduser(args.output or "."))
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        sys.exit(f"-o/--output must be a directory: {out_dir}")
+    if (not os.path.exists(out_dir)
+            and os.path.splitext(out_dir)[1].lower() in VIDEO_EXTS):
+        sys.exit(f"-o/--output is now an output directory, not a file: {out_dir}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    jobs = [(p, os.path.join(out_dir, output_name(p, args.multi))) for p in inputs]
+    seen = {}
+    input_set = set(inputs)
+    for src, dst in jobs:
+        if dst in seen:
+            sys.exit(f"output collision: {src} and {seen[dst]} both map to {dst}")
+        if dst in input_set:
+            sys.exit(f"output would overwrite a queued input: {dst}")
+        seen[dst] = src
+    return jobs
+
+
+class Runtime:
+    """Model + graph/engine for the active (resolution, batch) shape.
+
+    Queued files usually share a resolution.  Building the network, the TRT
+    engine and capturing the CUDA graph is expensive, so keep them alive between
+    files and only rebuild when the shape changes (one shape at a time keeps
+    VRAM flat).
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self._torch_net = None
+        self._key = None
+        self.net = None
+        self.runner = None
+        self.head_cache = args.head_cache
+
+    def _torch(self):
+        if self._torch_net is None:
+            self._torch_net = build_net(self.args)
+        return self._torch_net
+
+    def get(self, K, m, h, w, ph, pw):
+        batch = K * (m - 1)
+        key = (batch, ph, pw)
+        if key == self._key and self.net is not None:
+            return self.net, self.runner, self.head_cache
+
+        args = self.args
+        engine = args.trt_engine
+        if engine == "auto":
+            engine = ensure_engine(args, batch, h, w, ph, pw)
+        if engine:
+            from src.engine import TRTNet
+            net = TRTNet(engine, (batch, 6, ph, pw))
+            got = tuple(net.in0.shape)
+            if got != (batch, 3, ph, pw):
+                raise RuntimeError(
+                    f"TensorRT engine {engine} is {got}, this input needs "
+                    f"{(batch, 3, ph, pw)}; use --trt-engine auto")
+            head_cache = False  # the encoder lives inside the engine
+            runner = None
+            print(f"TensorRT engine: {engine}")
+        else:
+            net = self._torch()
+            head_cache = args.head_cache
+            runner = None
+            if args.cudagraph and DEV.type == "cuda":
+                try:
+                    runner = GraphRunner(net, (batch, 6, ph, pw),
+                                         scale_list_of(args.scale), batch,
+                                         net_dtype(net), with_feats=head_cache)
+                    print(f"CUDA graph captured ({pw}x{ph}, batch {batch})")
+                except Exception as e:  # noqa: BLE001 - capture is only an optimisation
+                    print(f"CUDA graph capture failed ({type(e).__name__}); "
+                          "continuing without it")
+                    runner = None
+        self.net, self.runner, self.head_cache, self._key = (
+            net, runner, head_cache, key)
+        return net, runner, head_cache
+
+
+def run_video(args, input_path, out_path, runtime):
     m = args.multi
     ts = [(i + 1) / m for i in range(m - 1)]
-    w, h, fps = ffprobe(args.input)
-    out_fps = args.fps or fps * m
+    w, h, fps = ffprobe(input_path)
+    if fps <= 0:
+        raise RuntimeError(f"could not read the frame rate of {input_path}")
+    out_fps = fps * m
     ph, pw = pad_size(h, w, args.pad_mult)
-    print(f"input {w}x{h} @ {fps:.3f} fps -> {m}x, padded {pw}x{ph}, out {out_fps:.3f} fps")
+    print(f"input {w}x{h} @ {fps:.3f} fps -> {m}X, padded {pw}x{ph}, "
+          f"out {out_fps:.3f} fps")
 
     K = args.batch_pairs or auto_batch_pairs(m, ph, pw)
     if args.batch_pairs is None:
         print(f"auto batch-pairs = {K} (batch {K*len(ts)})")
-    head_cache = args.head_cache
-    runner = None
-    if args.trt_engine == "auto":
-        args.trt_engine = ensure_engine(args, K * len(ts), h, w, ph, pw)
-    if args.trt_engine:
-        from src.engine import TRTNet
-        net = TRTNet(args.trt_engine, (K * len(ts), 6, ph, pw))
-        head_cache = False  # the encoder lives inside the engine
-        print(f"TensorRT engine: {args.trt_engine}")
-    else:
-        net = build_net(args)
-        dtype = net_dtype(net)
-        if args.cudagraph and DEV.type == "cuda":
-            try:
-                runner = GraphRunner(net, (K * len(ts), 6, ph, pw),
-                                     scale_list_of(args.scale), K * len(ts),
-                                     dtype, with_feats=head_cache)
-                print("CUDA graph captured")
-            except Exception as e:  # noqa: BLE001 - capture is only an optimisation
-                print(f"CUDA graph capture failed ({type(e).__name__}); "
-                      "continuing without it")
-                runner = None
-
-    out_path = args.output
-    png_dir = None
-    if args.png:
-        png_dir = args.output or "vid_out"
-        out_path = None
-    elif not out_path:
-        base, _ = os.path.splitext(args.input)
-        out_path = f"{base}_{m}X_{int(round(out_fps))}fps.mp4"
+    net, runner, head_cache = runtime.get(K, m, h, w, ph, pw)
 
     # NV12 through the pipe: no CPU swscale, half the D2H + pipe bytes
-    use_nv12 = (not args.png and args.pix_fmt != "rgb24"
-                and h % 2 == 0 and w % 2 == 0)
+    use_nv12 = args.pix_fmt != "rgb24" and h % 2 == 0 and w % 2 == 0
+    if args.encoder != "null" and os.path.exists(out_path):
+        os.remove(out_path)          # never report/mux a stale file from a failed run
+    _WST["wait"] = _WST["write"] = 0.0
     rq, wq = queue.Queue(maxsize=8), queue.Queue(maxsize=4)
-    reader = FrameReader(args.input, w, h, rq)
-    writer = FrameWriter(out_path, w, h, out_fps, wq, png_dir=png_dir,
+    reader = FrameReader(input_path, w, h, rq)
+    writer = FrameWriter(out_path, w, h, out_fps, wq,
                          pix_fmt="nv12" if use_nv12 else "rgb24",
-                         venc_args=None if (args.png or args.encoder == "null")
-                         else video_encoder_args(args, w, h),
+                         venc_args=(None if args.encoder == "null"
+                                    else video_encoder_args(args, w, h)),
                          null=(args.encoder == "null"))
     if use_nv12:
         print("piping NV12 (GPU colour conversion, no CPU swscale)")
@@ -537,7 +578,7 @@ def run_video(args):
 
     stats = dict(read=0.0, pin=0.0, h2d=0.0, fwd=0.0, bufwait=0.0)
     want_stats = bool(os.environ.get("RIFE_STATS"))
-    total_frames = ffprobe_frames(args.input, fps)
+    total_frames = ffprobe_frames(input_path, fps)
     total_pairs = (total_frames - 1) if total_frames else None
     from tqdm import tqdm
     pbar = tqdm(total=total_pairs, unit="pair", desc="interp",
@@ -645,30 +686,46 @@ def run_video(args):
             print(f"  {k:8s} {v/nch*1e3:7.2f}  ({100*v/el:5.1f}% of wall)")
         print(f"  {'wall':8s} {el/nch*1e3:7.2f}")
 
-    if out_path and os.path.exists(out_path):
+    if args.encoder != "null" and os.path.exists(out_path):
         sz = os.path.getsize(out_path)
         dur = max(done / max(fps, 1e-6), 1e-6)
         out_br = sz * 8 / dur
-        print(f"output : {sz/1e6:7.1f} MB  {out_br/1e6:5.2f} Mbps  "
+        print(f"output : {out_path}  {sz/1e6:7.1f} MB  {out_br/1e6:5.2f} Mbps  "
               f"({out_br/(w*h*out_fps):.3f} bit/pixel)")
-        src_br = ffprobe_bitrate(args.input)
-        if src_br and out_br > 1.8 * src_br:
-            print(f"  !! {out_br/src_br:.1f}x the source bitrate "
-                  f"({src_br/1e6:.2f} Mbps). File will be ~{out_br/src_br:.1f}x "
-                  f"the source size.\n     lower it with --cq "
-                  f"{args.cq + 4} / --cq {args.cq + 8}, or cap it with "
-                  f"--bitrate {max(2, round(src_br/1e6))}M")
 
-    if out_path and args.audio and has_audio(args.input):
+    if args.encoder != "null" and args.audio and has_audio(input_path):
         tmp = out_path + ".mux.mp4"
         subprocess.run(
-            ["ffmpeg", "-v", "error", "-y", "-i", out_path, "-i", args.input,
+            ["ffmpeg", "-v", "error", "-y", "-i", out_path, "-i", input_path,
              "-map", "0:v:0", "-map", "1:a:0?", "-c", "copy", "-shortest", tmp],
             check=False,
         )
         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
             shutil.move(tmp, out_path)
             print("audio muxed")
+
+
+def run_queue(args):
+    """Process every input file in order, reusing the model/engine between them."""
+    jobs = plan_jobs(args)
+    runtime = Runtime(args)
+    total = len(jobs)
+    failed = []
+    t0 = time.perf_counter()
+    for i, (src, dst) in enumerate(jobs, 1):
+        print(f"\n=== [{i}/{total}] {src} -> {dst}")
+        try:
+            run_video(args, src, dst, runtime)
+        except Exception as e:  # noqa: BLE001 - one bad file must not stop the queue
+            failed.append((src, e))
+            print(f"!! {src}: {e}", file=sys.stderr)
+
+    elapsed = time.perf_counter() - t0
+    print(f"\nqueue: {total - len(failed)}/{total} files done in {elapsed:.1f}s")
+    if failed:
+        print("failed: " + ", ".join(os.path.basename(p) for p, _ in failed),
+              file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +739,12 @@ def main():
 
     # -- 基本：日常只需要这几个 ----------------------------------------
     g = p.add_argument_group("基本参数")
-    g.add_argument("-i", "--input", "--video", dest="input")
-    g.add_argument("-o", "--output")
+    g.add_argument("-i", "--input", "--video", dest="input", nargs="+",
+                   action="extend", metavar="VIDEO",
+                   help="输入视频；可给多个，按给出顺序排队处理")
+    g.add_argument("-o", "--output", "--out-dir", dest="output", default=".",
+                   metavar="DIR",
+                   help="输出文件夹（默认当前目录）；文件名自动加 _2X 等标志")
     g.add_argument("-m", "--multi", type=int, default=2,
                    help="插帧倍率：2 / 4 / 8（默认 2）")
     g.add_argument("--exp", type=int, default=None, help="倍率 = 2**exp（等价 -m）")
@@ -692,10 +753,6 @@ def main():
     g.add_argument("--quality", "--cq", dest="cq", type=int, default=22,
                    help="画质档 18~30：越小越清晰、文件越大。默认 22（人眼不可闻）；"
                         "20=视觉无损，26=平衡，30=小体积")
-    g.add_argument("--bitrate", default="0",
-                   help="固定码率，如 4M；给了就不用 --quality")
-    g.add_argument("--fps", type=float, default=None, help="输出帧率（默认 源fps×倍率）")
-    g.add_argument("--png", action="store_true", help="输出 PNG 序列而不是视频")
     g.add_argument("--no-audio", dest="audio", action="store_false", help="不合并音轨")
 
     # -- 高级：一般不用动 ----------------------------------------------
@@ -755,7 +812,7 @@ def main():
         return
     if not args.input:
         p.error("--input is required (or use --bench)")
-    run_video(args)
+    run_queue(args)
 
 
 if __name__ == "__main__":
