@@ -8,7 +8,8 @@
     python -m src -i in.mp4 -m 2 --codec h265 --quality 28 -o out/
     python -m src -i in.mp4 -m 4 -o out/               # out/in_4X.mp4
 
-想更快：加 `--trt-engine auto`（首次会自动构建引擎，约 2 分钟）。
+默认就用 TensorRT（首次每个 分辨率×倍率 组合会自动构建两个引擎，约 2~4 分钟，
+之后直接复用）。想对比 PyTorch 路径或引擎建不起来时加 `--no-trt`。
 其余参数都在"高级参数"里，一般不用动。详见 README.md。
 """
 
@@ -28,7 +29,6 @@ import numpy as np
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
-import torch.nn.functional as F
 
 from src import ENGINES
 from src.net import load_flownet  # noqa: E402
@@ -118,15 +118,21 @@ def has_audio(path):
 
 
 class FrameReader(threading.Thread):
-    """Decode with ffmpeg into a queue of HWC uint8 arrays."""
+    """Decode with ffmpeg into a queue of NV12 planes ``[h*3//2, w]``.
 
-    def __init__(self, path, w, h, q):
+    NV12 (not rgb24) because the decoder hands us 4:2:0 anyway: the model input
+    is converted on the GPU and the *source* frames of the output go to the
+    encoder untouched (bit-exact, and half the PCIe traffic of rgb24).
+    """
+
+    def __init__(self, path, w, h, q, pad=None):
         super().__init__(daemon=True)
         self.w, self.h, self.q = w, h, q
-        self.nbytes = w * h * 3
+        self.nbytes = w * h * 3 // 2
+        vf = [] if pad is None else ["-vf", f"pad={pad[0]}:{pad[1]}"]
         self.proc = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:v:0",
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+             *vf, "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
             stdout=subprocess.PIPE, bufsize=self.nbytes * 8,
         )
 
@@ -136,7 +142,8 @@ class FrameReader(threading.Thread):
                 buf = self.proc.stdout.read(self.nbytes)
                 if not buf or len(buf) < self.nbytes:
                     break
-                self.q.put(np.frombuffer(buf, np.uint8).reshape(self.h, self.w, 3).copy())
+                self.q.put(np.frombuffer(buf, np.uint8).reshape(
+                    self.h + self.h // 2, self.w).copy())
         finally:
             self.q.put(None)
             self.proc.stdout.close()
@@ -209,6 +216,8 @@ def video_encoder_args(args, w=None, h=None):
     avoids the rate-control overhead of VBR (~2% faster).
     """
     codec = args.codec
+    if getattr(args, "encoder", "auto") == "x264":
+        codec = "x264"          # --encoder x264 is an explicit override
     if codec == "auto":
         # measured on a 4090: NVENC's HEVC beats H.264 by -9% bitrate at 1080p
         # and -25% at 1440p, but is 8% *worse* at 720p (CTU 64 is too coarse
@@ -291,35 +300,48 @@ class GraphRunner:
 
 
 _WST = {"wait": 0.0, "write": 0.0}
-_BT601 = None
+_SCRATCH: dict = {}
 
 
-def rgb_to_nv12(x: torch.Tensor) -> torch.Tensor:
-    """[F,3,H,W] uint8/fp16 RGB (NCHW, GPU) -> [F, H*3//2, W] uint8 NV12.
+def _scratch(key, shape, dtype, zero=True):
+    """One persistent buffer per role, re-allocated when the shape changes.
 
-    Works straight on NCHW: the previous version went through
-    ``permute(0,2,3,1).reshape(-1,3)`` which forces a full NHWC transpose copy
-    (44 MB per chunk at 720p) before the 3x3 colour matrix.
+    Keeping the same tensor alive across chunks keeps its address stable (the
+    forward pass reads/writes it every chunk) and avoids allocator churn; the
+    key deliberately ignores the shape so a queue with mixed resolutions does
+    not accumulate buffers ("only one shape at a time").
     """
-    global _BT601
-    nb, _, H, W = x.shape
-    if _BT601 is None or _BT601.device != x.device:
-        _BT601 = torch.tensor(                         # rows: Y,U,V  cols: R,G,B
-            [[0.2568, -0.1482, 0.4392],
-             [0.5041, -0.2910, -0.3678],
-             [0.0979, 0.4392, -0.0714]], device=x.device, dtype=torch.float16)
-    f = x.to(torch.float16)
-    # yuv[c] = sum_r f[r] * M[r, c]
-    r, g, b = f[:, 0], f[:, 1], f[:, 2]
-    m = _BT601
-    y = r * m[0, 0] + g * m[1, 0] + b * m[2, 0] + 16.0
-    u = r * m[0, 1] + g * m[1, 1] + b * m[2, 1] + 128.0
-    v = r * m[0, 2] + g * m[1, 2] + b * m[2, 2] + 128.0
-    y = y.clamp_(0, 255).to(torch.uint8)
-    # chroma in fp32: the 2x2 average of a 0..255 range loses ~2 dB in fp16
-    uv = F.avg_pool2d(torch.stack((u, v), 1).float(), 2)       # [nb,2,H/2,W/2]
-    uv = uv.clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).reshape(nb, H // 2, W)
-    return torch.cat((y.reshape(nb, H, W), uv), dim=1)
+    buf = _SCRATCH.get(key)
+    if buf is None or tuple(buf.shape) != tuple(shape) or buf.dtype != dtype:
+        buf = (torch.zeros if zero else torch.empty)(shape, device=DEV, dtype=dtype)
+        _SCRATCH[key] = buf
+    return buf
+
+
+_IDX: dict = {}
+
+
+def _dst_index(K, m):
+    from src.kernels import dst_index
+    idx = _IDX.get((K, m))
+    if idx is None:
+        idx = dst_index(K, m, DEV)
+        _IDX[(K, m)] = idx
+    return idx
+
+
+def warmup_kernels(h, w, ph, pw, K, m, dtype):
+    """Compile + run the Triton kernels once, outside the timed loop."""
+    if DEV.type != "cuda":
+        return
+    from src import kernels
+    yuv = torch.zeros(K + 1, h + h // 2, w, dtype=torch.uint8, device=DEV)
+    x = _scratch("x", (K + 1, 3, ph, pw), dtype)
+    kernels.nv12_to_rgb(x, yuv, h, w)
+    out = _scratch("out0", (K * m, h + h // 2, w), torch.uint8, zero=False)
+    mid = torch.zeros(K * (m - 1), 3, x.shape[2], x.shape[3], device=DEV, dtype=dtype)
+    kernels.rgb_to_nv12(out, mid, yuv, _dst_index(K, m), m - 1, h, w)
+    torch.cuda.synchronize()
 
 
 def scale_list_of(scale):
@@ -327,43 +349,64 @@ def scale_list_of(scale):
 
 
 @torch.inference_mode()
-def chunk_forward(net, frames_u8_gpu, n_real, ts, scale, h, w, ph, pw, runner, K,
-                  head_cache=True, nv12=False):
-    """[K+1,H,W,3] uint8 on GPU -> [n_real*(n+1),H,W,3] uint8 on CPU."""
+def chunk_forward(net, yuv_gpu, n_real, ts, scale, h, w, ph, pw, runner, K,
+                  head_cache=True, nv12=True, out_slot=0):
+    """[K+1, h*3//2, w] uint8 NV12 on GPU -> [n_real*(n+1), h*3//2, w] NV12 on GPU.
+
+    Source frames of the output are the decoder's own planes (no colour math at
+    all, bit-exact); the interpolated frames get luma from the network output and
+    chroma from the 2x2 box average of the same interpolated RGB.
+
+    (Blending the two *source* chroma planes instead looked equivalent on paper
+    -- RGB->YUV is linear -- but the interpolated RGB is motion compensated, not
+    a blend, so luma and chroma edges disagree and the bitrate went up 44%.)
+    """
+    from src import kernels
+
     dtype = net_dtype(net)
-    # NHWC uint8 -> NCHW is a permute (free); its memory layout *is* channels_last
-    x = frames_u8_gpu.to(dtype).div_(255.0).permute(0, 3, 1, 2)
-    if pw != w or ph != h:
-        x = F.pad(x, (0, pw - w, 0, ph - h))
+    n = len(ts)
+    x = _scratch("x", (K + 1, 3, ph, pw), dtype)
+    kernels.nv12_to_rgb(x, yuv_gpu, h, w)
+
     cl = getattr(net, "_channels_last", False) or getattr(
         getattr(net, "_orig_mod", net), "_channels_last", False)
     if cl:
         x = x.contiguous(memory_format=torch.channels_last)
-    n = len(ts)
+
     # a CUDA graph / TRT engine has a fixed batch: always feed K pairs, then
     # keep only the frames that belong to real pairs
     fixed = runner is not None or getattr(net, "fixed_batch", False)
     n_batch = K if fixed else n_real
-    i0 = x[:n_batch].repeat_interleave(n, 0)
-    i1 = x[1:n_batch + 1].repeat_interleave(n, 0)
-    # one batched Head over the K+1 distinct frames instead of 2K encodes
-    feats = net.encode(x[:n_batch + 1]) if head_cache else None
-    f0 = feats[:n_batch].repeat_interleave(n, 0) if head_cache else None
-    f1 = feats[1:n_batch + 1].repeat_interleave(n, 0) if head_cache else None
+    takes_frames = getattr(net, "takes_frames", False)
     t = torch.tensor(ts, dtype=dtype, device=DEV).repeat(n_batch)
-    xin = torch.cat((i0, i1), 1)
-    if runner is not None:
-        mid = runner(xin, t, f0, f1)
+    if takes_frames:
+        # Head+Body TRT: hand over the K+1 distinct frames, the graph slices them
+        mid = net(x[: K + 1], t)
     else:
-        mid = net(xin, t, scale_list_of(scale), f0=f0, f1=f1)
-    mid = mid[: n_real * n]
-    mid = mid.mul_(255.0).clamp_(0, 255).to(torch.uint8)[:, :, :h, :w]  # NCHW
-    mid = mid.view(n_real, n, 3, h, w)
-    left = frames_u8_gpu[:n_real].permute(0, 3, 1, 2).unsqueeze(1)      # NCHW
-    rgb = torch.cat((left, mid), 1).reshape(-1, 3, h, w)                # GPU, uint8
-    if not nv12:
-        return rgb.permute(0, 2, 3, 1)
-    return rgb_to_nv12(rgb)
+        i0 = x[:n_batch].repeat_interleave(n, 0)
+        i1 = x[1:n_batch + 1].repeat_interleave(n, 0)
+        # one batched Head over the K+1 distinct frames instead of 2K encodes
+        feats = net.encode(x[:n_batch + 1]) if head_cache else None
+        f0 = feats[:n_batch].repeat_interleave(n, 0) if feats is not None else None
+        f1 = feats[1:n_batch + 1].repeat_interleave(n, 0) if feats is not None else None
+        xin = torch.cat((i0, i1), 1)
+        if runner is not None:
+            mid = runner(xin, t, f0, f1)
+        else:
+            mid = net(xin, t, scale_list_of(scale), f0=f0, f1=f1)
+
+    m = len(ts) + 1
+    out = _scratch(f"out{out_slot}", (K * m, h + h // 2, w), torch.uint8,
+                   zero=False)
+    kernels.rgb_to_nv12(out, mid, yuv_gpu, _dst_index(K, m), n, h, w)
+    out = out[: n_real * m]
+    if nv12:
+        return out
+    rgb = torch.empty(out.shape[0], h, w, 3, device=DEV, dtype=torch.uint8)
+    tmp = _scratch("rgb", (out.shape[0], 3, ph, pw), dtype)
+    kernels.nv12_to_rgb(tmp, out.contiguous(), h, w)
+    rgb.copy_(tmp[:, :, :h, :w].mul_(255.0).to(torch.uint8).permute(0, 2, 3, 1))
+    return rgb
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +431,8 @@ def bench(args):
         if args.cudagraph and DEV.type == "cuda":
             runner = GraphRunner(net, (B, 6, ph, pw), scale_list_of(args.scale), B, dtype,
                                  with_feats=args.head_cache)
-        frames = torch.randint(0, 255, (K + 1, args.height, args.width, 3),
+        frames = torch.randint(0, 255, (K + 1, args.height + args.height // 2,
+                                       args.width),
                                dtype=torch.uint8, device=DEV)
         for _ in range(3):
             chunk_forward(net, frames, K, ts, args.scale, args.height, args.width,
@@ -413,22 +457,28 @@ def bench(args):
 # ---------------------------------------------------------------------------
 
 
-def ensure_engine(args, batch, h, w, ph, pw):
-    """--trt-engine auto: one engine per (resolution, batch), built on demand."""
+def engine_pair(spec):
+    """``rife.engine`` -> (``rife.head.engine``, ``rife.body.engine``)."""
+    base = os.path.splitext(spec)[0]
+    return base + ".head.engine", base + ".body.engine"
+
+
+def ensure_engine(args, K, m, h, w, ph, pw):
+    """--trt-engine auto: Head+Body engines per (resolution, K, multi)."""
     os.makedirs(ENGINES, exist_ok=True)
-    from src.engine import engine_name
-    name = os.path.join(str(ENGINES), engine_name(pw, ph, batch))
-    if os.path.exists(name):
-        return name
+    from src.engine import build, engine_files, export
+    head, body = engine_files(pw, ph, K, m, args.scale, args.mode)
+    if os.path.exists(head) and os.path.exists(body):
+        return head, body
     if not torch.cuda.is_available():
         sys.exit("--trt-engine auto needs CUDA")
-    from src.engine import build, export
-    print(f"[trt] {name} not found, exporting + building "
-          f"({pw}x{ph}, batch {batch}, ~2 min)")
-    onnx = name.replace(".engine", ".onnx")
-    export(h, w, batch, args.scale, onnx, args.mode, fp16=True)
-    build(onnx, name, fp16=True)
-    return name
+    print(f"[trt] {os.path.basename(body)} not found, exporting + building "
+          f"({pw}x{ph}, K={K}, {m}x, ~2-4 min)")
+    head_onnx, body_onnx = export(h, w, K, m, args.scale, args.mode,
+                                 fp16=True, pad_mult=args.pad_mult)
+    build(head_onnx, head, fp16=True)
+    build(body_onnx, body, fp16=True)
+    return head, body
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".flv", ".ts"}
@@ -495,20 +545,28 @@ class Runtime:
             return self.net, self.runner, self.head_cache
 
         args = self.args
-        engine = args.trt_engine
-        if engine == "auto":
-            engine = ensure_engine(args, batch, h, w, ph, pw)
-        if engine:
-            from src.engine import TRTNet
-            net = TRTNet(engine, (batch, 6, ph, pw))
-            got = tuple(net.in0.shape)
-            if got != (batch, 3, ph, pw):
-                raise RuntimeError(
-                    f"TensorRT engine {engine} is {got}, this input needs "
-                    f"{(batch, 3, ph, pw)}; use --trt-engine auto")
-            head_cache = False  # the encoder lives inside the engine
+        spec, net, paths = args.trt_engine, None, None
+        if spec:
+            try:
+                if spec == "auto":
+                    spec = ensure_engine(args, K, m, h, w, ph, pw)
+                paths = spec if isinstance(spec, tuple) else engine_pair(spec)
+                from src.engine import TRTNet
+                net = TRTNet(*paths, use_graph=args.cudagraph)
+                if net.in_shape != (K + 1, 3, ph, pw):
+                    raise RuntimeError(
+                        f"{os.path.basename(paths[0])} takes {net.in_shape}, this "
+                        f"input needs {(K + 1, 3, ph, pw)}")
+            except Exception as e:  # noqa: BLE001 - TRT is an optimisation
+                print(f"[trt] {type(e).__name__}: {e}")
+                print("[trt] falling back to the PyTorch path (15~25% slower); "
+                      "pass --no-trt to silence this")
+                net = None
+        if net is not None:
+            head_cache = False  # the Head lives inside the graph
             runner = None
-            print(f"TensorRT engine: {engine}")
+            print(f"TensorRT engine: {os.path.basename(paths[1])} "
+                  f"(head {net.pairs + 1} frames -> {net.batch} samples)")
         else:
             net = self._torch()
             head_cache = args.head_cache
@@ -534,6 +592,13 @@ def run_video(args, input_path, out_path, runtime):
     w, h, fps = ffprobe(input_path)
     if fps <= 0:
         raise RuntimeError(f"could not read the frame rate of {input_path}")
+    # 4:2:0 (NV12) cannot represent odd sizes; pad by one pixel if needed
+    pad = None
+    if (w & 1) or (h & 1):
+        pw_, ph_ = w + (w & 1), h + (h & 1)
+        print(f"note: {w}x{h} is odd, padding to {pw_}x{ph_} (4:2:0 needs even "
+              "dimensions); the output will have the padded size")
+        pad, (w, h) = (pw_, ph_), (pw_, ph_)
     out_fps = fps * m
     ph, pw = pad_size(h, w, args.pad_mult)
     print(f"input {w}x{h} @ {fps:.3f} fps -> {m}X, padded {pw}x{ph}, "
@@ -543,14 +608,18 @@ def run_video(args, input_path, out_path, runtime):
     if args.batch_pairs is None:
         print(f"auto batch-pairs = {K} (batch {K*len(ts)})")
     net, runner, head_cache = runtime.get(K, m, h, w, ph, pw)
+    warmup_kernels(h, w, ph, pw, K, m, net_dtype(net))
 
     # NV12 through the pipe: no CPU swscale, half the D2H + pipe bytes
     use_nv12 = args.pix_fmt != "rgb24" and h % 2 == 0 and w % 2 == 0
+    if not use_nv12:
+        print("note: opaque output requested -- converting NV12 back to rgb24 "
+              "(slower, only useful for debugging)")
     if args.encoder != "null" and os.path.exists(out_path):
         os.remove(out_path)          # never report/mux a stale file from a failed run
     _WST["wait"] = _WST["write"] = 0.0
     rq, wq = queue.Queue(maxsize=8), queue.Queue(maxsize=4)
-    reader = FrameReader(input_path, w, h, rq)
+    reader = FrameReader(input_path, w, h, rq, pad)
     writer = FrameWriter(out_path, w, h, out_fps, wq,
                          pix_fmt="nv12" if use_nv12 else "rgb24",
                          venc_args=(None if args.encoder == "null"
@@ -573,7 +642,7 @@ def run_video(args, input_path, out_path, runtime):
             bufs.append(torch.empty((n_out,) + frame_shape, dtype=torch.uint8,
                                     pin_memory=True))
             pool.put(i)
-    pin_in = (torch.empty((K + 1, h, w, 3), dtype=torch.uint8, pin_memory=True)
+    pin_in = (torch.empty((K + 1, h + h // 2, w), dtype=torch.uint8, pin_memory=True)
               if DEV.type == "cuda" else None)
 
     stats = dict(read=0.0, pin=0.0, h2d=0.0, fwd=0.0, bufwait=0.0)
@@ -587,6 +656,7 @@ def run_video(args, input_path, out_path, runtime):
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
                            "[{elapsed}<{remaining}, {rate_fmt}] {postfix}")
     window, done, eof = [], 0, False
+    out_slot = 0
     t_start = pbar_t = time.perf_counter()
 
     def fill():
@@ -621,8 +691,11 @@ def run_video(args, input_path, out_path, runtime):
         _ev0 = torch.cuda.Event(True) if want_stats else None
         if _ev0 is not None:
             _ev0.record()
+        # ping-pong output buffers: chunk n's D2H reads slot n%2 while chunk
+        # n+1 writes slot (n+1)%2, so no cross-stream wait is needed
+        out_slot ^= 1
         out_gpu = chunk_forward(net, gpu, n_real, ts, args.scale, h, w, ph, pw,
-                                runner, K, head_cache, use_nv12)
+                                runner, K, head_cache, use_nv12, out_slot)
         _t4 = time.perf_counter()
         if _ev0 is not None:
             _ev1 = torch.cuda.Event(True)
@@ -663,10 +736,15 @@ def run_video(args, input_path, out_path, runtime):
         if copy_stream is not None:
             slot = pool.get()
             buf = bufs[slot]
-            last = torch.from_numpy(window[0])
+            last = torch.from_numpy(window[0])      # already NV12 from the decoder
             if use_nv12:
-                last = rgb_to_nv12(last.to(DEV).permute(2, 0, 1)[None])[0].cpu()
-            buf[0].copy_(last)
+                buf[0].copy_(last)
+            else:
+                from src import kernels
+                tmp = torch.zeros(1, 3, ph, pw, device=DEV, dtype=net_dtype(net))
+                kernels.nv12_to_rgb(tmp, last.to(DEV)[None], h, w)
+                buf[0].copy_(tmp[0, :, :h, :w].mul_(255.0).to(torch.uint8)
+                             .permute(1, 2, 0).cpu())
             wq.put((buf.numpy()[:1], None, slot, pool))
         else:
             wq.put(window[:1])
@@ -688,7 +766,8 @@ def run_video(args, input_path, out_path, runtime):
 
     if args.encoder != "null" and os.path.exists(out_path):
         sz = os.path.getsize(out_path)
-        dur = max(done / max(fps, 1e-6), 1e-6)
+        n_frames = done * m + 1          # pairs*m mid frames + the tail source
+        dur = max(n_frames / max(out_fps, 1e-6), 1e-6)
         out_br = sz * 8 / dur
         print(f"output : {out_path}  {sz/1e6:7.1f} MB  {out_br/1e6:5.2f} Mbps  "
               f"({out_br/(w*h*out_fps):.3f} bit/pixel)")
@@ -757,8 +836,11 @@ def main():
 
     # -- 高级：一般不用动 ----------------------------------------------
     a = p.add_argument_group("高级参数（一般不用改）")
-    a.add_argument("--trt-engine", default=None,
-                   help="'auto' = 按分辨率/批次/权重自动找或建引擎（推荐）")
+    a.add_argument("--trt-engine", default="auto", metavar="auto|BASE",
+                   help="默认 auto：按 分辨率/K/倍率/权重 自动找或建引擎"
+                        "（首次每个组合约 2~4 分钟）；也可给一个基准路径")
+    a.add_argument("--no-trt", dest="trt_engine", action="store_const", const=None,
+                   help="禁用 TensorRT，走 PyTorch（慢 15~25%%）")
     a.add_argument("--batch-pairs", type=int, default=None,
                    help="每次前向的帧对数；默认按 分辨率×倍率 自动选")
     a.add_argument("--scale", type=float, default=1.0, help="内部工作分辨率倍数（4K 用 0.5）")

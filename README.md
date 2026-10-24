@@ -7,12 +7,17 @@ RIFE 4.25 的高速插帧流水线：**NVDEC 解码 → RIFE 推理（TensorRT�
 
 | 指标 | 原始 `inference_video.py` | 本工具 | 倍数 |
 |------|--------------------------|--------|------|
-| 720p 2x | ~100 对/s | **274 对/s（548 fps 输出）** | **2.7×** |
-| 1080p 2x | — | 116 对/s（232 fps） | — |
+| 720p 2x | ~100 对/s | **≈350 对/s（700 fps 输出）** | **3.5×** |
+| 1080p 2x | — | **≈186 对/s（372 fps）** | — |
 | 画质 | 基准 | 与原始 fp32 **51.1 dB**，`assemble` 档**逐位一致** | 无损 |
 
+以上是默认配置（TensorRT）在 RTX 4090 上的实测；绝对值随 GPU 温度/功耗状态有 ±5% 漂移，
+同一台机器上 1080p 2x 长跑（3 万帧）稳定在 186 对/s。
+
 技术细节与所有实测数据见 [`docs/report.md`](docs/report.md)，
-做过但放弃的方案见 [`docs/experiments.md`](docs/experiments.md)。
+做过但放弃的方案见 [`docs/experiments.md`](docs/experiments.md)，
+架构级分析（v1→v2 的四项改动、与 `vs-rife`/`vs-mlrt` 的机制对照、剩余空间）见
+[`docs/optimization.md`](docs/optimization.md)。
 
 ---
 
@@ -61,22 +66,23 @@ uv sync --extra png   # 额外装 opencv（validate / 画质对比等开发工�
 ```
 
 TensorRT 通过 pip 安装（`tensorrt` 包自带 CUDA 库），不需要另外装 NVIDIA 的 tarball。
-首次运行时会自动导出 ONNX 并构建引擎（约 2 分钟/分辨率）。
+首次运行时会自动导出并构建 **两个** 引擎（Head + IFNet，约 2~4 分钟/分辨率×倍率）。
 
 ---
 
 ## 2. 快速开始
 
 ```bash
-# 720p 2x —— 默认就是实测最快的配置；输出到 out/in_2X.mp4
+# 720p 2x —— 默认就走 TensorRT，即实测最快的配置；输出到 out/in_2X.mp4
+# （首次跑某个 分辨率×倍率 组合会先建两个引擎，约 2~4 分钟，之后复用）
 uv run rife-fast -i in.mp4 -m 2 -o out
 
 # 多文件排队：按给出顺序逐个处理，输出到同一个文件夹
 uv run rife-fast -i a.mp4 b.mp4 c.mp4 -m 2 -o out
 uv run rife-fast -i a.mp4 -i b.mp4 -m 2 -o out      # 等价写法
 
-# 加上 TensorRT（再快 ~20%）
-uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
+# 想对比纯 PyTorch 路径（慢 16%（720p）~26%（1080p））
+uv run rife-fast -i in.mp4 -m 2 --no-trt -o out
 
 # 4x / 8x
 uv run rife-fast -i in.mp4 -m 4 -o out              # out/in_4X.mp4
@@ -105,7 +111,8 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o out
 | `-m, --multi` | 倍率 2/4/8（`--exp 3` 等价于 `-m 8`）；输出帧率 = 源帧率 × 倍率 |
 | `--codec` | `auto`（默认）：≤1080p 用 h264，>1080p 用 h265。也可强制 `h264`/`h265`/`x264`/`x265` |
 | `--quality`（别名 `--cq`） | 画质档 18–30，越小越清晰、文件越大。默认 **22** |
-| `--trt-engine auto` | 用 TensorRT，按分辨率/批次/权重自动找或建引擎 |
+| `--trt-engine` | **默认 `auto`**：按 分辨率/K/倍率/权重 自动找或建引擎；也可给基准路径 |
+| `--no-trt` | 关闭 TensorRT，走 PyTorch（慢 15~25%） |
 | `--no-audio` | 不合并音轨 |
 
 ### 3.2 高级参数（一般不用动）
@@ -170,8 +177,9 @@ RIFE_FAST/
 │   ├── IFNet_HDv3.py  # 内置网络结构（可被 models/ 里的同名文件覆盖）
 │   └── tools/         # 开发期工具（bench/profile/quality/...）
 ├── docs/
-│   ├── report.md      # 性能报告与所有实测数据
-│   └── experiments.md # 已放弃方案的归档
+│   ├── report.md       # 性能报告与所有实测数据
+│   ├── experiments.md  # 已放弃方案的归档
+│   └── optimization.md # 架构级分析 + 上游对照 + 优化路线图
 └── pyproject.toml
 ```
 
@@ -225,7 +233,17 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 `--quality 30`。结束时会打印实际码率。
 
 **Q: 显存不够？**
-2K 用 `--batch-pairs 2`，4K 用 `--scale 0.5`。720p 峰值约 1.2 GiB。
+2K 用 `--batch-pairs 2`，4K 用 `--scale 0.5`。720p 2x 峰值约 **2.3 GiB**，
+8x（batch 7）约 **3.0 GiB**（Head 与 IFNet 各一份引擎 + 运行时激活）。
+
+**Q: 第一次跑某个分辨率/倍率为什么要等 2~4 分钟？**
+TensorRT 引擎是按 `(分辨率, K, 倍率, 权重)` 静态编译的，首次要导出 ONNX 并编译
+两个引擎（Head + IFNet），日志会打印 `[trt] ... not found, exporting + building`。
+之后同一个组合直接复用；换分辨率/倍率/权重会再建一份（旧的不会自动删）。
+
+**Q: 输入是奇数分辨率（如 1279×719）？**
+4:2:0 表示不了奇数尺寸，会自动 pad 到偶数（1279×719 → 1280×720）并提示，
+输出也是填充后的尺寸。
 
 **Q: 换分辨率要重建引擎吗？**
 要，引擎绑定 `(W, H, batch)`。用 `--trt-engine auto` 会自动处理。
@@ -239,8 +257,9 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 流水线受"输出帧数"限制（编码器/IO），不是帧对数。倍率越高帧对/s 按比例下降。
 
 **Q: 能不能不用 TensorRT？**
-可以，不加 `--trt-engine auto` 就走 PyTorch（fp16 + CUDA Graph），慢约 25%。
-TensorRT 已经是必需依赖，不需要时可从 `pyproject.toml` 删掉。
+可以，加 `--no-trt` 就走 PyTorch（fp16 + CUDA Graph），实测端到端慢
+16%（720p：352 vs 305 对/s）~24%（1080p：183 vs 148）。
+TensorRT 是必需依赖，不需要时可从 `pyproject.toml` 删掉（那样就只能 `--no-trt`）。
 
 ---
 
