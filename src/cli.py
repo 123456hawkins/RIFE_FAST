@@ -118,32 +118,68 @@ def has_audio(path):
 
 
 class FrameReader(threading.Thread):
-    """Decode with ffmpeg into a queue of NV12 planes ``[h*3//2, w]``.
+    """Decode with ffmpeg into a ring of buffers of ``[h*3//2, w]`` NV12 frames.
+
+    Two modes:
+
+    * with ``free_q``/``bufs`` (CUDA path): ffmpeg writes **straight into a
+      pinned buffer** (``os.readv``), so a frame costs one kernel copy instead
+      of three (``read()`` -> ``bytes`` -> ``numpy.copy()`` -> pinned).  That
+      was ~4x the CPU of the whole rest of the pipeline, mostly page faults on
+      the freshly mmap'd 3 MB objects.
+    * without (CPU fallback): the plain ``read``+``copy`` path.
 
     NV12 (not rgb24) because the decoder hands us 4:2:0 anyway: the model input
     is converted on the GPU and the *source* frames of the output go to the
     encoder untouched (bit-exact, and half the PCIe traffic of rgb24).
     """
 
-    def __init__(self, path, w, h, q, pad=None):
+    def __init__(self, path, w, h, q, pad=None, free_q=None, bufs=None):
         super().__init__(daemon=True)
         self.w, self.h, self.q = w, h, q
+        self.free_q, self.bufs = free_q, bufs
         self.nbytes = w * h * 3 // 2
         vf = [] if pad is None else ["-vf", f"pad={pad[0]}:{pad[1]}"]
         self.proc = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:v:0",
              *vf, "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
-            stdout=subprocess.PIPE, bufsize=self.nbytes * 8,
+            stdout=subprocess.PIPE,
+            bufsize=0 if bufs is not None else self.nbytes * 8,
         )
 
     def run(self):
         try:
+            if self.bufs is None:
+                while True:
+                    buf = self.proc.stdout.read(self.nbytes)
+                    if not buf or len(buf) < self.nbytes:
+                        break
+                    self.q.put(np.frombuffer(buf, np.uint8).reshape(
+                        self.h + self.h // 2, self.w).copy())
+                return
+            fd = self.proc.stdout.fileno()
+            n = self.nbytes
             while True:
-                buf = self.proc.stdout.read(self.nbytes)
-                if not buf or len(buf) < self.nbytes:
+                slot, ev = self.free_q.get()
+                if slot is None:
                     break
-                self.q.put(np.frombuffer(buf, np.uint8).reshape(
-                    self.h + self.h // 2, self.w).copy())
+                if ev is not None:
+                    # never reuse a slot whose H2D may still be in flight; poll
+                    # instead of synchronize(), which would busy-wait (an event
+                    # that old is ready ~always, so the sleep is a safety net)
+                    while not ev.query():
+                        time.sleep(0.0005)
+                mv = memoryview(self.bufs[slot].numpy()).cast("B")
+                got = 0
+                while got < n:
+                    r = os.readv(fd, [mv[got:]])
+                    if r == 0:
+                        break
+                    got += r
+                if got < n:
+                    self.free_q.put((slot, None))
+                    break
+                self.q.put(slot)
         finally:
             self.q.put(None)
             self.proc.stdout.close()
@@ -318,6 +354,25 @@ def _scratch(key, shape, dtype, zero=True):
     return buf
 
 
+_T_CACHE: dict = {}
+
+
+def _timesteps(ts, n_batch, dtype):
+    """The [B] timestep tensor, built once per (ts, batch, dtype).
+
+    ``torch.tensor(python_list, device='cuda')`` copies through pageable memory,
+    which is a *synchronising* H2D: it stalls the compute stream and busy-waits
+    for it (~0.3 ms measured, plus it kills the CPU/GPU overlap).  The
+    timesteps never change for a given run, so build them once.
+    """
+    key = (tuple(ts), n_batch, dtype)
+    t = _T_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(list(ts) * n_batch, dtype=dtype, device=DEV)
+        _T_CACHE[key] = t
+    return t
+
+
 _IDX: dict = {}
 
 
@@ -378,7 +433,7 @@ def chunk_forward(net, yuv_gpu, n_real, ts, scale, h, w, ph, pw, runner, K,
     fixed = runner is not None or getattr(net, "fixed_batch", False)
     n_batch = K if fixed else n_real
     takes_frames = getattr(net, "takes_frames", False)
-    t = torch.tensor(ts, dtype=dtype, device=DEV).repeat(n_batch)
+    t = _timesteps(ts, n_batch, dtype)
     if takes_frames:
         # Head+Body TRT: hand over the K+1 distinct frames, the graph slices them
         mid = net(x[: K + 1], t)
@@ -618,8 +673,18 @@ def run_video(args, input_path, out_path, runtime):
     if args.encoder != "null" and os.path.exists(out_path):
         os.remove(out_path)          # never report/mux a stale file from a failed run
     _WST["wait"] = _WST["write"] = 0.0
+    # input ring: the decoder writes into these pinned buffers, the GPU copies
+    # from them directly, so a frame costs one memcpy instead of three
+    in_bufs = in_free = None
+    if DEV.type == "cuda":
+        in_bufs = [torch.empty((h + h // 2, w), dtype=torch.uint8, pin_memory=True)
+                   for _ in range(24)]
+        in_free = queue.Queue()
+        for _i in range(len(in_bufs)):
+            in_free.put((_i, None))
+    yuv_gpu = _scratch("yuv", (K + 1, h + h // 2, w), torch.uint8, zero=False)
     rq, wq = queue.Queue(maxsize=8), queue.Queue(maxsize=4)
-    reader = FrameReader(input_path, w, h, rq, pad)
+    reader = FrameReader(input_path, w, h, rq, pad, in_free, in_bufs)
     writer = FrameWriter(out_path, w, h, out_fps, wq,
                          pix_fmt="nv12" if use_nv12 else "rgb24",
                          venc_args=(None if args.encoder == "null"
@@ -642,10 +707,8 @@ def run_video(args, input_path, out_path, runtime):
             bufs.append(torch.empty((n_out,) + frame_shape, dtype=torch.uint8,
                                     pin_memory=True))
             pool.put(i)
-    pin_in = (torch.empty((K + 1, h + h // 2, w), dtype=torch.uint8, pin_memory=True)
-              if DEV.type == "cuda" else None)
 
-    stats = dict(read=0.0, pin=0.0, h2d=0.0, fwd=0.0, bufwait=0.0)
+    stats = dict(read=0.0, h2d=0.0, fwd=0.0, bufwait=0.0)
     want_stats = bool(os.environ.get("RIFE_STATS"))
     total_frames = ffprobe_frames(input_path, fps)
     total_pairs = (total_frames - 1) if total_frames else None
@@ -678,16 +741,14 @@ def run_video(args, input_path, out_path, runtime):
         chunk = window[: n_real + 1]
         if n_real < K:  # pad the batch to the fixed graph shape
             chunk = chunk + [chunk[-1]] * (K - n_real)
-        if pin_in is not None:
-            # copy frame by frame: np.stack would add a second full-size memcpy
-            for _i, _fr in enumerate(chunk):
-                pin_in[_i].copy_(torch.from_numpy(_fr))
+        if in_bufs is not None:
+            for _i, _slot in enumerate(chunk):     # one H2D per frame, no CPU copy
+                yuv_gpu[_i].copy_(in_bufs[_slot], non_blocking=True)
+            gpu = yuv_gpu
             _t2 = time.perf_counter()
-            gpu = pin_in[: len(chunk)].to(DEV, non_blocking=True)
         else:
             gpu = torch.from_numpy(np.stack(chunk))
             _t2 = time.perf_counter()
-        _t3 = time.perf_counter()
         _ev0 = torch.cuda.Event(True) if want_stats else None
         if _ev0 is not None:
             _ev0.record()
@@ -707,9 +768,8 @@ def run_video(args, input_path, out_path, runtime):
             _t5 = time.perf_counter()
             if want_stats:
                 stats["read"] += _t1 - _t0
-                stats["pin"] += _t2 - _t1
-                stats["h2d"] += _t3 - _t2
-                stats["fwd"] += _t4 - _t3
+                stats["h2d"] += _t2 - _t1
+                stats["fwd"] += _t4 - _t2
                 stats["bufwait"] += _t5 - _t4
             buf = bufs[slot]
             # the wait must be issued *outside* the stream context, otherwise
@@ -723,6 +783,11 @@ def run_video(args, input_path, out_path, runtime):
         else:
             wq.put(out_gpu.cpu().numpy())
         done += n_real
+        if in_free is not None:                    # hand the used slots back
+            ev = torch.cuda.Event()
+            ev.record()
+            for _s in window[:n_real]:
+                in_free.put((_s, ev))
         window = window[n_real:]
         pbar.update(n_real)
         now = time.perf_counter()
@@ -736,7 +801,8 @@ def run_video(args, input_path, out_path, runtime):
         if copy_stream is not None:
             slot = pool.get()
             buf = bufs[slot]
-            last = torch.from_numpy(window[0])      # already NV12 from the decoder
+            last = (in_bufs[window[0]] if in_bufs is not None
+                    else torch.from_numpy(window[0]))   # already NV12
             if use_nv12:
                 buf[0].copy_(last)
             else:
@@ -876,6 +942,16 @@ def main():
         args.multi = 2 ** args.exp
     if args.multi < 2:
         p.error("--multi must be >= 2")
+
+    # Every heavy step runs on the GPU; the only CPU work is small memcpys and
+    # tensor bookkeeping.  PyTorch's intra-op pool would otherwise wake ~30
+    # threads for those copies and keep them busy for the whole run
+    # (measured: 9.5 cores vs 0.8 cores, identical throughput).
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass                        # already started; harmless
 
     if DEV.type != "cuda":
         args.fp16 = False          # half precision on CPU is slower, not faster
