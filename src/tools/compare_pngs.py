@@ -1,12 +1,13 @@
 """Per-frame PSNR between two PNG directories.
 
-    python -m src.compare_pngs dir_a dir_b
+    uv run python -m src.tools.compare_pngs dir_a dir_b
 """
 import os
 import sys
 
-import cv2
 import numpy as np
+
+from src.imgio import read_png
 
 
 def main():
@@ -19,8 +20,8 @@ def main():
         sys.exit("no pngs")
     se, mx, worst = 0.0, 0.0, []
     for i in range(n):
-        x = cv2.imread(os.path.join(a, fa[i])).astype(np.float32)
-        y = cv2.imread(os.path.join(b, fb[i])).astype(np.float32)
+        x = read_png(os.path.join(a, fa[i])).astype(np.float32)
+        y = read_png(os.path.join(b, fb[i])).astype(np.float32)
         d = (x - y) ** 2
         se += d.mean()
         mx = max(mx, float(np.abs(x - y).max()))

@@ -1,15 +1,17 @@
 """Per-frame PSNR between two videos.
 
-    python -m src.compare_videos A.mp4 B.mp4 1280 720
+    uv run python -m src.tools.compare_videos A.mp4 B.mp4 1280 720
 """
 import subprocess
 import sys
 
 import numpy as np
 
+from src.ffmpeg_util import ffmpeg
+
 
 def frames(path, w, h):
-    p = subprocess.Popen(["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo",
+    p = subprocess.Popen([ffmpeg(), "-v", "error", "-i", path, "-f", "rawvideo",
                           "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
     n = w * h * 3
     try:

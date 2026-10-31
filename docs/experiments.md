@@ -69,7 +69,8 @@ ffmpeg 内部是多缓冲异步的。**语言不是收益来源，流水线结�
 - **双 NVENC 分流**：4090/4080 有 2 个编码引擎，按奇偶帧切分理论 ~2×；用户明确排除，未做。
 - **轻量模型（4.25.lite）**：画质有损，要求保效果，排除。
 - **TensorRT 动态 shape**：静态 shape 每层能独立选 tactic（更快），代价是换分辨率要重建引擎；
-  现在由 `--trt-engine auto` 按 `rife_<W>x<H>_b<batch>_<权重指纹>.engine` 自动处理。
+  现在由 `--trt-engine auto` 按 `rife_<W>x<H>_k<K>m<M>_<GPU架构_TRT版本>_<权重指纹>.engine`
+  自动处理。GPU 架构 tag 见 `docs/multigpu_3090.md`。
 
 ## 5. 双 NVENC 分流（实测不可行）
 

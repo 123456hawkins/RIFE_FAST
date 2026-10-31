@@ -5,6 +5,7 @@
 > **352 对/s**、1080p 2x 从 148 提到 **187**、4x/8x 各 +30% 左右；v2 的数字见
 > [`optimization.md`](optimization.md) §2.2。
 > 另外 §4 里"NVENC 空载 960 fps"是短样本口径，长样本实测 **1500 fps**。
+> 双 RTX 3090 的适配、多卡实测与 3090 对比见 [`multigpu_3090.md`](multigpu_3090.md)。
 >
 > 环境：RTX 4090 24G · torch 2.14+cu130 · TensorRT 11.4 · ffmpeg 4.4.2
 > 所有数字都是本机实测。复现命令见 `README.md`。

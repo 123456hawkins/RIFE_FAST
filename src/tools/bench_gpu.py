@@ -1,9 +1,9 @@
 """Measure every optimisation on *your* GPU, one variable at a time.
 
-    uv run python -m src.bench_gpu                 # 720p, 2x
-    uv run python -m src.bench_gpu -m 8            # 8x (7 timesteps/pair)
-    uv run python -m src.bench_gpu --compile       # include torch.compile
-    uv run python -m src.bench_gpu --psnr          # + quality check
+    uv run python -m src.tools.bench_gpu                 # 720p, 2x
+    uv run python -m src.tools.bench_gpu -m 8            # 8x (7 timesteps/pair)
+    uv run python -m src.tools.bench_gpu --compile       # include torch.compile
+    uv run python -m src.tools.bench_gpu --psnr          # + quality check
 
 Columns:
     ms/pair   wall time per input frame pair (multi-1 frames produced)
@@ -17,6 +17,7 @@ import argparse
 import os
 import time
 
+import numpy as np
 import torch
 
 from src import MODELS, ROOT
@@ -87,13 +88,21 @@ def main():
     from src.weights import load_ifnet_class
     stock = load_ifnet_class()()
     _sd = torch.load(str(MODELS / "flownet.pkl"), map_location="cpu")
+    if any(k.startswith("module.") for k in _sd):
+        _sd = {k.replace("module.", "", 1): v for k, v in _sd.items()}
     _own = stock.state_dict()
-    stock.load_state_dict({k: v for k, v in _sd.items() if k in _own})
+    _missing = [k for k in _own if k not in _sd]
+    if _missing:
+        raise RuntimeError(f"checkpoint is missing {len(_missing)} tensors: "
+                           f"{_missing[:4]}")
+    stock.load_state_dict({k: v for k, v in _sd.items() if k in _own},
+                          strict=True)
     stock.eval().to(DEV)
     SCALES = [16, 8, 4, 2, 1]
 
     def stock_infer(x0, x1, t=0.5):
-        return stock(torch.cat((x0, x1), 1), t, SCALES)[2][3]
+        # merged[-1] is the final blended frame (merged[3] is a tuple pair)
+        return stock(torch.cat((x0, x1), 1), t, SCALES)[2][-1]
 
     base = None
 
@@ -247,12 +256,12 @@ def main():
         # multi-scale model, so use the demo pair instead.
         import math
 
-        import cv2
-        import numpy as np
+        from src.imgio import read_png, resize_rgb
 
         def rd(path):
-            im = cv2.resize(cv2.imread(path), (pw, ph))[:, :, ::-1]
-            return torch.from_numpy(np.ascontiguousarray(im.transpose(2, 0, 1)))[None]
+            im = resize_rgb(read_png(path), pw, ph)
+            return torch.from_numpy(
+                np.ascontiguousarray(im.transpose(2, 0, 1)))[None]
 
         i0 = rd(os.path.join(ROOT, "assets", "I0_0.png")).to(DEV).float() / 255.0
         i1 = rd(os.path.join(ROOT, "assets", "I0_1.png")).to(DEV).float() / 255.0

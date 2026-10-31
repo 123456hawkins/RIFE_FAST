@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import queue
@@ -30,7 +31,7 @@ import numpy as np
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 
-from src import ENGINES
+from src import ENGINES, ffmpeg_util
 from src.net import load_flownet  # noqa: E402
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,7 +73,8 @@ def ffprobe(path):
         raise RuntimeError(f"input not found: {path}")
     try:
         out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            [ffmpeg_util.ffprobe(), "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
              "stream=width,height,r_frame_rate,avg_frame_rate", "-of", "json", path],
             stderr=subprocess.PIPE,
         ).decode()
@@ -94,7 +96,8 @@ def ffprobe_frames(path, fps):
     """Total frame count (falls back to duration*fps for containers without it)."""
     try:
         out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            [ffmpeg_util.ffprobe(), "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
              "stream=nb_frames:format=duration", "-of", "json", path]).decode()
         j = json.loads(out)
         n = j.get("streams", [{}])[0].get("nb_frames", "")
@@ -109,8 +112,8 @@ def ffprobe_frames(path, fps):
 def has_audio(path):
     try:
         out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
-             "stream=index", "-of", "csv=p=0", path]
+            [ffmpeg_util.ffprobe(), "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path]
         ).decode().strip()
         return bool(out)
     except (subprocess.CalledProcessError, IndexError):
@@ -134,15 +137,25 @@ class FrameReader(threading.Thread):
     encoder untouched (bit-exact, and half the PCIe traffic of rgb24).
     """
 
-    def __init__(self, path, w, h, q, pad=None, free_q=None, bufs=None):
+    def __init__(self, path, w, h, q, pad=None, free_q=None, bufs=None,
+                 start_frame=None, end_frame=None, fps=None):
         super().__init__(daemon=True)
         self.w, self.h, self.q = w, h, q
         self.free_q, self.bufs = free_q, bufs
         self.nbytes = w * h * 3 // 2
         vf = [] if pad is None else ["-vf", f"pad={pad[0]}:{pad[1]}"]
+        cmd = [ffmpeg_util.ffmpeg(), "-v", "error", "-nostdin"]
+        if start_frame:
+            # input-side seek is frame accurate for transcoding: ffmpeg seeks to
+            # the preceding keyframe, decodes and drops until the target frame
+            cmd += ["-ss", f"{start_frame / fps:.9f}"]
+        cmd += ["-i", path, "-map", "0:v:0", *vf]
+        if end_frame is not None:
+            cmd += ["-frames:v", str(int(end_frame) - int(start_frame or 0))]
+        # no duplication/dropping: each decoded frame is one output frame
+        cmd += ["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "nv12", "-"]
         self.proc = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:v:0",
-             *vf, "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
+            cmd,
             stdout=subprocess.PIPE,
             bufsize=0 if bufs is not None else self.nbytes * 8,
         )
@@ -204,7 +217,7 @@ class FrameWriter(threading.Thread):
             pix = "nv12"
         else:
             pix = "yuv420p" if (w % 2 == 0 and h % 2 == 0) else "yuv444p"
-        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo",
+        cmd = [ffmpeg_util.ffmpeg(), "-v", "error", "-y", "-f", "rawvideo",
                "-pix_fmt", pix_fmt, "-s", f"{w}x{h}", "-r", f"{fps:.6f}",
                "-i", "-", "-an", *v, "-pix_fmt", pix, path]
         bpp = 1.5 if pix_fmt == "nv12" else 3
@@ -281,6 +294,27 @@ def video_encoder_args(args, w=None, h=None):
     if is_hevc:
         v += ["-tag:v", "hvc1"]
     return v
+
+
+def mux_audio(input_path, out_path):
+    """Copy the source audio track into ``out_path`` (no-op without audio)."""
+    if not has_audio(input_path):
+        return False
+    tmp = out_path + ".mux.mp4"
+    r = subprocess.run(
+        [ffmpeg_util.ffmpeg(), "-v", "error", "-y", "-i", out_path,
+         "-i", input_path, "-map", "0:v:0", "-map", "1:a:0?", "-c", "copy",
+         "-shortest", tmp],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        msg = r.stderr.decode(errors="replace").strip().splitlines()
+        print(f"warning: audio mux failed ({msg[-1] if msg else 'ffmpeg error'})")
+        return False
+    shutil.move(tmp, out_path)
+    print("audio muxed")
+    return True
 
 
 def build_net(args):
@@ -519,20 +553,37 @@ def engine_pair(spec):
 
 
 def ensure_engine(args, K, m, h, w, ph, pw):
-    """--trt-engine auto: Head+Body engines per (resolution, K, multi)."""
+    """--trt-engine auto: Head+Body engines per (resolution, K, multi).
+
+    Two GPU workers processing one video share ``engines/``.  They must not
+    build the same plan twice: an advisory lock serialises the build, the
+    second worker waits and then reuses the result.  The engine file itself is
+    written atomically (``build`` uses write+rename).
+    """
     os.makedirs(ENGINES, exist_ok=True)
-    from src.engine import build, engine_files, export
-    head, body = engine_files(pw, ph, K, m, args.scale, args.mode)
+    from src.engine import build, engine_files, export, gpu_tag
+    head, body = engine_files(pw, ph, K, m, args.scale, args.mode, args.model)
     if os.path.exists(head) and os.path.exists(body):
         return head, body
     if not torch.cuda.is_available():
         sys.exit("--trt-engine auto needs CUDA")
-    print(f"[trt] {os.path.basename(body)} not found, exporting + building "
-          f"({pw}x{ph}, K={K}, {m}x, ~2-4 min)")
-    head_onnx, body_onnx = export(h, w, K, m, args.scale, args.mode,
-                                 fp16=True, pad_mult=args.pad_mult)
-    build(head_onnx, head, fp16=True)
-    build(body_onnx, body, fp16=True)
+    lock_path = os.path.splitext(body)[0] + ".lock"
+    with open(lock_path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"[trt] another process is building "
+                  f"{os.path.basename(body)}; waiting...", flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(head) and os.path.exists(body):
+            return head, body
+        print(f"[trt] {os.path.basename(body)} not found, exporting + building "
+              f"({pw}x{ph}, K={K}, {m}x, {gpu_tag()}, ~2-5 min)", flush=True)
+        head_onnx, body_onnx = export(h, w, K, m, args.scale, args.mode,
+                                      fp16=True, pad_mult=args.pad_mult,
+                                      model_dir=args.model)
+        build(head_onnx, head, fp16=True)
+        build(body_onnx, body, fp16=True)
     return head, body
 
 
@@ -614,7 +665,7 @@ class Runtime:
                         f"input needs {(K + 1, 3, ph, pw)}")
             except Exception as e:  # noqa: BLE001 - TRT is an optimisation
                 print(f"[trt] {type(e).__name__}: {e}")
-                print("[trt] falling back to the PyTorch path (15~25% slower); "
+                print("[trt] falling back to the PyTorch path (15~30% slower); "
                       "pass --no-trt to silence this")
                 net = None
         if net is not None:
@@ -641,22 +692,47 @@ class Runtime:
         return net, runner, head_cache
 
 
-def run_video(args, input_path, out_path, runtime):
+def run_video(args, input_path, out_path, runtime, start_frame=None,
+              end_frame=None, skip_first=False):
+    """Interpolate one input file (or one frame range of it).
+
+    ``start_frame``/``end_frame`` are used by the multi-GPU path to split a
+    single video into contiguous pair ranges; ``end_frame`` is exclusive.
+    ``skip_first`` drops the leading source frame, because the previous segment
+    already emitted it (segments concatenate into exactly the same frame
+    sequence as a single-process run).
+    """
     m = args.multi
     ts = [(i + 1) / m for i in range(m - 1)]
     w, h, fps = ffprobe(input_path)
     if fps <= 0:
         raise RuntimeError(f"could not read the frame rate of {input_path}")
+    gpu_tag = os.environ.get("RIFE_GPU_TAG")
+    tag = f"[gpu {gpu_tag}] " if gpu_tag is not None else ""
+    seg = (start_frame is not None or end_frame is not None)
+    total = None
+    if seg:
+        total = ffprobe_frames(input_path, fps)
+        start_frame = int(start_frame or 0)
+        if end_frame is None:
+            if total is None:
+                raise RuntimeError(f"cannot segment {input_path}: unknown length")
+            end_frame = total
+        end_frame = int(end_frame)
+        if not (0 <= start_frame < end_frame):
+            raise RuntimeError(f"bad segment {start_frame}:{end_frame}")
     # 4:2:0 (NV12) cannot represent odd sizes; pad by one pixel if needed
     pad = None
     if (w & 1) or (h & 1):
         pw_, ph_ = w + (w & 1), h + (h & 1)
-        print(f"note: {w}x{h} is odd, padding to {pw_}x{ph_} (4:2:0 needs even "
-              "dimensions); the output will have the padded size")
+        print(f"{tag}note: {w}x{h} is odd, padding to {pw_}x{ph_} (4:2:0 needs "
+              "even dimensions); the output will have the padded size")
         pad, (w, h) = (pw_, ph_), (pw_, ph_)
     out_fps = fps * m
     ph, pw = pad_size(h, w, args.pad_mult)
-    print(f"input {w}x{h} @ {fps:.3f} fps -> {m}X, padded {pw}x{ph}, "
+    span = (f" frames {start_frame}..{end_frame - 1} (of {total})"
+            if seg else "")
+    print(f"{tag}input {w}x{h} @ {fps:.3f} fps -> {m}X{span}, padded {pw}x{ph}, "
           f"out {out_fps:.3f} fps")
 
     K = args.batch_pairs or auto_batch_pairs(m, ph, pw)
@@ -684,7 +760,8 @@ def run_video(args, input_path, out_path, runtime):
             in_free.put((_i, None))
     yuv_gpu = _scratch("yuv", (K + 1, h + h // 2, w), torch.uint8, zero=False)
     rq, wq = queue.Queue(maxsize=8), queue.Queue(maxsize=4)
-    reader = FrameReader(input_path, w, h, rq, pad, in_free, in_bufs)
+    reader = FrameReader(input_path, w, h, rq, pad, in_free, in_bufs,
+                         start_frame=start_frame, end_frame=end_frame, fps=fps)
     writer = FrameWriter(out_path, w, h, out_fps, wq,
                          pix_fmt="nv12" if use_nv12 else "rgb24",
                          venc_args=(None if args.encoder == "null"
@@ -710,17 +787,24 @@ def run_video(args, input_path, out_path, runtime):
 
     stats = dict(read=0.0, h2d=0.0, fwd=0.0, bufwait=0.0)
     want_stats = bool(os.environ.get("RIFE_STATS"))
-    total_frames = ffprobe_frames(input_path, fps)
-    total_pairs = (total_frames - 1) if total_frames else None
+    total_frames = ((end_frame - start_frame) if seg
+                    else ffprobe_frames(input_path, fps))
+    total_pairs = max(total_frames - 1, 0) if total_frames else None
     from tqdm import tqdm
+    want_progress = os.environ.get("RIFE_PROGRESS", "1") != "0"
+    # workers inherit a terminal shared with their siblings; stacked tqdm bars
+    # from separate processes fight over the cursor, so workers print lines
+    use_bar = (want_progress and sys.stdout.isatty()
+               and not os.environ.get("RIFE_WORKER"))
     pbar = tqdm(total=total_pairs, unit="pair", desc="interp",
                 dynamic_ncols=True, smoothing=0.05,
-                disable=None,   # auto: bar in a TTY, plain lines in a log
+                disable=not use_bar,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
                            "[{elapsed}<{remaining}, {rate_fmt}] {postfix}")
     window, done, eof = [], 0, False
     out_slot = 0
-    t_start = pbar_t = time.perf_counter()
+    skip_pending = bool(skip_first)
+    t_start = pbar_t = last_log = time.perf_counter()
 
     def fill():
         nonlocal eof
@@ -779,9 +863,16 @@ def run_video(args, input_path, out_path, runtime):
                 buf[: out_gpu.shape[0]].copy_(out_gpu, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(copy_stream)
-            wq.put((buf.numpy()[: out_gpu.shape[0]], ev, slot, pool))
+            first = 1 if skip_pending else 0
+            skip_pending = False
+            if first >= out_gpu.shape[0]:       # nothing to emit from this chunk
+                pool.put(slot)
+            else:
+                wq.put((buf.numpy()[first: out_gpu.shape[0]], ev, slot, pool))
         else:
-            wq.put(out_gpu.cpu().numpy())
+            first = 1 if skip_pending else 0
+            skip_pending = False
+            wq.put(out_gpu.cpu().numpy()[first:])
         done += n_real
         if in_free is not None:                    # hand the used slots back
             ev = torch.cuda.Event()
@@ -794,8 +885,14 @@ def run_video(args, input_path, out_path, runtime):
         if now - pbar_t > 0.25:
             pbar_t = now
             el = max(now - t_start, 1e-6)
-            pbar.set_postfix_str(f"{done/el:6.1f} pair/s  "
-                                 f"{done*m/el:6.0f} fps out")
+            if use_bar:
+                pbar.set_postfix_str(f"{done/el:6.1f} pair/s  "
+                                     f"{done*m/el:6.0f} fps out")
+            elif want_progress and now - last_log >= 5.0:
+                last_log = now
+                tot = f"/{total_pairs}" if total_pairs else ""
+                print(f"{tag}{done}{tot} pairs  {done/el:6.1f} pair/s  "
+                      f"{done*m/el:6.0f} fps out", flush=True)
 
     if window:  # last frame
         if copy_stream is not None:
@@ -811,15 +908,29 @@ def run_video(args, input_path, out_path, runtime):
                 kernels.nv12_to_rgb(tmp, last.to(DEV)[None], h, w)
                 buf[0].copy_(tmp[0, :, :h, :w].mul_(255.0).to(torch.uint8)
                              .permute(1, 2, 0).cpu())
-            wq.put((buf.numpy()[:1], None, slot, pool))
+            first = 1 if skip_pending else 0
+            skip_pending = False
+            if first < 1:
+                wq.put((buf.numpy()[:1], None, slot, pool))
+            else:                              # first source frame already emitted
+                pool.put(slot)
         else:
-            wq.put(window[:1])
+            wq.put(window[:1 if not skip_pending else 0])
     pbar.close()
     wq.put(None)
     writer.join()
     reader.join()
     el = time.perf_counter() - t_start
-    print(f"\ndone: {done} pairs in {el:.1f}s ({done/el:.1f} pairs/s, "
+    # A truncated/seek-past-EOF input would otherwise produce a short part and
+    # still look successful to the multi-GPU scheduler.  For an explicit frame
+    # range the expected pair count is exact, so fail the task and let the
+    # scheduler retry/report it.
+    expected_pairs = total_frames - 1 if total_frames else None
+    if seg and expected_pairs is not None and done != expected_pairs:
+        raise RuntimeError(
+            f"{input_path}: segment {start_frame}..{end_frame - 1} produced "
+            f"{done} pairs, expected {expected_pairs} (truncated/corrupt input?)")
+    print(f"\n{tag}done: {done} pairs in {el:.1f}s ({done/el:.1f} pairs/s, "
           f"{done*m/el:.1f} out-fps)")
     if want_stats:
         nch = max(1, round(done / K))
@@ -832,22 +943,16 @@ def run_video(args, input_path, out_path, runtime):
 
     if args.encoder != "null" and os.path.exists(out_path):
         sz = os.path.getsize(out_path)
-        n_frames = done * m + 1          # pairs*m mid frames + the tail source
+        # each pair contributes m output frames; the first source frame is the
+        # +1, unless a multi-GPU segment already emitted it
+        n_frames = done * m + (0 if skip_first else 1)
         dur = max(n_frames / max(out_fps, 1e-6), 1e-6)
         out_br = sz * 8 / dur
-        print(f"output : {out_path}  {sz/1e6:7.1f} MB  {out_br/1e6:5.2f} Mbps  "
+        print(f"{tag}output : {out_path}  {sz/1e6:7.1f} MB  {out_br/1e6:5.2f} Mbps  "
               f"({out_br/(w*h*out_fps):.3f} bit/pixel)")
 
-    if args.encoder != "null" and args.audio and has_audio(input_path):
-        tmp = out_path + ".mux.mp4"
-        subprocess.run(
-            ["ffmpeg", "-v", "error", "-y", "-i", out_path, "-i", input_path,
-             "-map", "0:v:0", "-map", "1:a:0?", "-c", "copy", "-shortest", tmp],
-            check=False,
-        )
-        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            shutil.move(tmp, out_path)
-            print("audio muxed")
+    if args.encoder != "null" and args.audio:
+        mux_audio(input_path, out_path)
 
 
 def run_queue(args):
@@ -932,6 +1037,16 @@ def main():
     a.add_argument("--model", default=None, help="权重目录（默认 models/）")
     a.add_argument("--pad-mult", type=int, default=64)
     a.add_argument("--no-head-cache", dest="head_cache", action="store_false")
+    a.add_argument("--gpus", nargs="+", default=None, metavar="GPU",
+                   help="多卡：0,1 或 all（每卡一个子进程，共享任务队列，"
+                        "完成即取下一个任务）")
+    a.add_argument("--gpu-strategy", default="auto",
+                   choices=["auto", "files", "segments"],
+                   help="auto=按视频数/时长自动选（默认）；files=整文件任务；"
+                        "segments=视频都按帧分段后任务队列分发")
+    a.add_argument("--engine-per-gpu", action="store_true",
+                   help="每张卡单独构建 TRT 引擎（首次多花约一倍构建时间，"
+                        "避免跨卡 plan 的 TRT 警告与潜在性能损失）")
     a.add_argument("--bench", action="store_true", help="只测模型吞吐，不读写视频")
     a.add_argument("--iters", type=int, default=20)
     a.add_argument("--width", type=int, default=1280, help="--bench only")
@@ -942,6 +1057,13 @@ def main():
         args.multi = 2 ** args.exp
     if args.multi < 2:
         p.error("--multi must be >= 2")
+    if args.bench and args.gpus:
+        print("note: --bench measures device 0 only; ignoring --gpus")
+        args.gpus = None
+    if args.engine_per_gpu:
+        # read by engine.gpu_tag() when the engine file name is built; workers
+        # inherit it through the environment
+        os.environ["RIFE_ENGINE_PER_GPU"] = "1"
 
     # Every heavy step runs on the GPU; the only CPU work is small memcpys and
     # tensor bookkeeping.  PyTorch's intra-op pool would otherwise wake ~30
@@ -957,9 +1079,12 @@ def main():
         args.fp16 = False          # half precision on CPU is slower, not faster
         args.cudagraph = False
     torch.set_grad_enabled(False)
-    if DEV.type == "cuda":
+    if DEV.type == "cuda" and not args.gpus:
         torch.backends.cudnn.benchmark = True
         print(f"GPU: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
+    elif DEV.type == "cuda":
+        # parent stays off CUDA: each worker gets its own context/engine/graph
+        print(f"multi-GPU: {args.gpus}  torch {torch.__version__}")
 
     if args.compile != "off" and args.cudagraph:
         print("note: torch.compile(reduce-overhead) already uses CUDA graphs; "
@@ -970,6 +1095,15 @@ def main():
         return
     if not args.input:
         p.error("--input is required (or use --bench)")
+    try:
+        ffmpeg_util.check()
+    except RuntimeError as e:
+        sys.exit(f"error: {e}")
+    if args.gpus:
+        from src.multigpu import run_multi_gpu
+        if not run_multi_gpu(args):
+            sys.exit(1)
+        return
     run_queue(args)
 
 

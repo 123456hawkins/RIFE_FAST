@@ -401,6 +401,9 @@ PCIe 不是瓶颈（22 MB/chunk ≈ 1.1 ms @20 GB/s），SM 算力也不是。
 
 ### 8.2 还能做的
 
+> 多卡已做（每卡一个进程，单视频分段/多文件分发）：2×3090 720p 长跑 **1.74×**，
+> 见 [`multigpu_3090.md`](multigpu_3090.md)。下表是剩下的单卡优化空间。
+
 | 项 | 预期 | 代价 | 结论 |
 |----|-----:|------|------|
 | **4x/8x 的 head 跨 chunk 复用**（head 只算 K 帧） | 模型 −2%（2x）/ −1%（8x） | 特征环形缓冲 + 相位图 | 收益太小，不做 |
@@ -477,7 +480,7 @@ PCIe 不是瓶颈（22 MB/chunk ≈ 1.1 ms @20 GB/s），SM 算力也不是。
 
 | # | 位置 | 问题 |
 |---|------|------|
-| 1 | `engine.py:engine_name` | 名字里仍没有 TRT 版本 / GPU 名 / 优化级别 → 升级 TRT 或换卡后可能读到不兼容引擎（反序列化失败会直接 `sys.exit`） |
+| 1 | ~~`engine.py:engine_name`~~ | **已修（本轮）**：名字加入 `sm<arch>_trt<major.minor>`、`--model` 目录权重的 md5；反序列化失败改为抛异常并由 `Runtime.get` 回退 PyTorch，不再 `sys.exit`。双卡/3090 适配见 `multigpu_3090.md` |
 | 2 | `net.py:_base_grid` | fp32 网格 cast 成 fp16（vs-rife `4cfcd18` 同类问题）；720p/1080p 未复现，4K 上线前处理 |
 | 3 | `cli.py` | `--scale != 1` 时输出分辨率不变但内部金字塔变粗，画质会下降（文档已注明是 4K 降算力用，未做画质标定） |
 
@@ -599,7 +602,7 @@ mkdir -p /tmp/rf && cd /tmp/rf
 ffmpeg -y -stream_loop 4 -i demo720_long.mp4 -c copy -an demo720_x5.mp4    # 2400 帧
 ffmpeg -y -stream_loop 19 -i demo1080p.mp4   -c copy -an demo1080_x20.mp4  # 1920 帧
 
-# 端到端（默认就走 TRT；首次导出 + 构建 2 个引擎，约 2~4 分钟）
+# 端到端（默认就走 TRT；首次导出 + 构建 2 个引擎，约 2~5 分钟）
 uv run python -m src -i /tmp/rf/demo720_x5.mp4   -m 2 -o /tmp/rf                    # 352 对/s
 uv run python -m src -i /tmp/rf/demo720_x5.mp4   -m 2 -o /tmp/rf --no-trt           # 305（对照）
 uv run python -m src -i /tmp/rf/demo720_x5.mp4   -m 4 -o /tmp/rf                    # 145

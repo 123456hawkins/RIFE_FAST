@@ -43,8 +43,8 @@ Notes
 from __future__ import annotations
 
 import argparse
+import functools
 import os
-import sys
 import time
 
 import torch
@@ -53,35 +53,81 @@ from src import ENGINES, MODELS
 from src.net import IFNetFast, load_flownet  # noqa: E402
 
 
-def weights_tag() -> str:
+@functools.lru_cache(maxsize=None)
+def weights_tag(model_dir: str | None = None) -> str:
     """Short hash of the checkpoint: engines embed the weights, so the tag
-    changes (and the engine is rebuilt) as soon as you swap flownet.pkl."""
+    changes (and the engine is rebuilt) as soon as you swap flownet.pkl.
+
+    ``model_dir`` must be the directory actually used by ``--model``; hashing
+    the default ``models/`` while loading weights from somewhere else would let
+    a run silently reuse an engine built for different weights.
+    """
     import hashlib
-    path = str(MODELS / "flownet.pkl")
+    base = model_dir or str(MODELS)
+    path = os.path.join(base, "flownet.pkl")
     if not os.path.exists(path):
         return "noweights"
     with open(path, "rb") as f:
         return hashlib.md5(f.read()).hexdigest()[:8]
 
 
+@functools.lru_cache(maxsize=None)
+def gpu_tag() -> str:
+    """Compute capability + TensorRT version, e.g. ``sm86_trt114``.
+
+    TensorRT plans are **not portable across GPU architectures** and are tied
+    to the TensorRT major/minor.  An engine built on a 4090 (sm89) must never be
+    picked up on a 3090 (sm86): deserialization fails and the whole queue used
+    to die in ``sys.exit``.  Baking the tag into the file name makes the cache
+    self-selecting instead.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:                                    # noqa: BLE001
+        return "gpu"
+    try:
+        from importlib.metadata import version
+        v = version("tensorrt").split(".")[:2]
+        trt = "trt" + "".join(x for x in v if x.isdigit())
+    except Exception:                                    # noqa: BLE001
+        trt = "trtna"
+    tag = f"sm{major}{minor}_{trt}"
+    if os.environ.get("RIFE_ENGINE_PER_GPU", "").lower() in ("1", "true", "yes"):
+        # escape hatch: TensorRT warns (and officially does not support) using
+        # one plan on two physical cards, even of the same model.  Opting in
+        # here makes every card build/keep its own plan.
+        try:
+            uuid = str(torch.cuda.get_device_properties(
+                torch.cuda.current_device()).uuid).replace("-", "")[:8]
+            tag += f"_{uuid}"
+        except Exception:                                # noqa: BLE001
+            pass
+    return tag
+
+
 def engine_name(w: int, h: int, pairs: int, multi: int, scale: float = 1.0,
-                mode: str = "pyramid") -> str:
+                mode: str = "pyramid", model_dir: str | None = None) -> str:
     """Base name (without ``.head.engine`` / ``.body.engine``).
 
     Everything that is baked into the exported graph shows up in the name:
     ``scale`` (pyramid scale list) and ``mode`` (pyramid vs assemble vs ref)
     are only spelled out when they differ from the default, so existing engines
-    keep their names.
+    keep their names.  The GPU/TRT tag is always present (see :func:`gpu_tag`),
+    because a plan built for another architecture cannot be loaded.
     """
     tag = "" if float(scale) == 1.0 else f"_s{scale:g}"
     if mode != "pyramid":
         tag += f"_{mode}"
-    return f"rife_{w}x{h}_k{pairs}m{multi}{tag}_{weights_tag()}"
+    return (f"rife_{w}x{h}_k{pairs}m{multi}{tag}_{gpu_tag()}_"
+            f"{weights_tag(model_dir)}")
 
 
 def engine_files(w: int, h: int, pairs: int, multi: int, scale: float = 1.0,
-                 mode: str = "pyramid"):
-    base = os.path.join(str(ENGINES), engine_name(w, h, pairs, multi, scale, mode))
+                 mode: str = "pyramid", model_dir: str | None = None):
+    base = os.path.join(str(ENGINES),
+                        engine_name(w, h, pairs, multi, scale, mode, model_dir))
     return f"{base}.head.engine", f"{base}.body.engine"
 
 
@@ -126,7 +172,8 @@ class _BodyWrap(torch.nn.Module):
 
 
 def export(h: int, w: int, pairs: int, multi: int, scale: float = 1.0,
-           mode: str = "pyramid", fp16: bool = True, pad_mult: int = 64):
+           mode: str = "pyramid", fp16: bool = True, pad_mult: int = 64,
+           model_dir: str | None = None):
     """Write the Head and IFNet ONNX files; returns ``(head_onnx, body_onnx)``.
 
     ``pairs`` is the number of frame pairs per forward (``--batch-pairs``) and
@@ -137,7 +184,7 @@ def export(h: int, w: int, pairs: int, multi: int, scale: float = 1.0,
         ((w - 1) // pad_mult + 1) * pad_mult
     n = multi - 1
     batch = pairs * n
-    net = load_flownet(None, DEV, fp16=fp16, mode=mode).eval()
+    net = load_flownet(model_dir, DEV, fp16=fp16, mode=mode).eval()
     dt = torch.float16 if fp16 else torch.float32
 
     x = torch.rand(pairs + 1, 3, ph, pw, device=DEV, dtype=dt)
@@ -147,7 +194,8 @@ def export(h: int, w: int, pairs: int, multi: int, scale: float = 1.0,
     f1 = torch.rand(batch, 4, ph, pw, device=DEV, dtype=dt)
     t = torch.full((batch,), 0.5, device=DEV, dtype=dt)
 
-    head_onnx, body_onnx = engine_files(pw, ph, pairs, multi, scale, mode)
+    head_onnx, body_onnx = engine_files(pw, ph, pairs, multi, scale, mode,
+                                        model_dir)
     head_onnx = head_onnx.replace(".engine", ".onnx")
     body_onnx = body_onnx.replace(".engine", ".onnx")
     kw = dict(opset_version=17, do_constant_folding=True)
@@ -205,9 +253,10 @@ def build(onnx_path: str, engine_path: str, fp16: bool = True,
     parser = trt.OnnxParser(network, logger)
     with open(onnx_path, "rb") as f:
         if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                print("TRT parse error:", parser.get_error(i))
-            sys.exit(1)
+            errs = [parser.get_error(i) for i in range(parser.num_errors)]
+            for e in errs:
+                print("TRT parse error:", e)
+            raise RuntimeError(f"TensorRT could not parse {onnx_path}")
     cfg = builder.create_builder_config()
     pool = getattr(trt, "MemoryPoolType", None)
     if pool is not None:
@@ -226,9 +275,17 @@ def build(onnx_path: str, engine_path: str, fp16: bool = True,
     t0 = time.perf_counter()
     ser = builder.build_serialized_network(network, cfg)
     if ser is None:
-        sys.exit("TRT build failed (see errors above)")
-    with open(engine_path, "wb") as f:
-        f.write(ser)
+        raise RuntimeError("TensorRT build failed (see errors above)")
+    # write-then-rename: two GPU workers may race for the same shape (they share
+    # engines/) and a reader must never open a half-written plan
+    tmp = f"{engine_path}.tmp{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(ser)
+        os.replace(tmp, engine_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     print(f"built {engine_path} in {time.perf_counter() - t0:.0f}s "
           f"({os.path.getsize(engine_path) / 2**20:.1f} MiB)")
 
@@ -254,7 +311,11 @@ class _Ctx:
         with open(path, "rb") as f:
             self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
         if self.engine is None:
-            sys.exit(f"could not deserialize {path}")
+            # don't sys.exit(): the caller may still fall back to PyTorch
+            raise RuntimeError(
+                f"could not deserialize {os.path.basename(path)}; the plan was "
+                f"built for a different GPU/TensorRT (this machine: {gpu_tag()}). "
+                f"Delete engines/ and let --trt-engine auto rebuild it.")
         self.ctx = self.engine.create_execution_context()
         self.names = {}
         for i in range(self.engine.num_io_tensors):
@@ -394,9 +455,10 @@ class TRTNet:
 # ---------------------------------------------------------------------------
 
 
-def bench(h: int, w: int, pairs: int, multi: int, iters: int = 100):
+def bench(h: int, w: int, pairs: int, multi: int, iters: int = 100,
+          model_dir: str | None = None):
     ph, pw = ((h - 1) // 64 + 1) * 64, ((w - 1) // 64 + 1) * 64
-    head, body = engine_files(pw, ph, pairs, multi)
+    head, body = engine_files(pw, ph, pairs, multi, model_dir=model_dir)
     net = TRTNet(head, body)
     x = torch.rand(*net.in_shape, device=DEV, dtype=net.dtype)
     t = torch.full((net.batch,), 0.5, device=DEV, dtype=net.dtype)
@@ -424,6 +486,7 @@ def main():
     e.add_argument("--mode", default="pyramid")
     e.add_argument("--fp32", dest="fp16", action="store_false",
                    help="export fp32 (default is fp16 for TRT>=11)")
+    e.add_argument("--model", default=None, help="weights directory")
     b = sub.add_parser("build")
     b.add_argument("--onnx", required=True)
     b.add_argument("--engine", default=None)
@@ -434,16 +497,18 @@ def main():
     c.add_argument("--pairs", type=int, default=4)
     c.add_argument("--multi", type=int, default=2)
     c.add_argument("--iters", type=int, default=100)
+    c.add_argument("--model", default=None, help="weights directory")
     a = p.parse_args()
 
     os.makedirs(ENGINES, exist_ok=True)
     if a.cmd == "export":
-        export(a.h, a.w, a.pairs, a.multi, a.scale, a.mode, a.fp16)
+        export(a.h, a.w, a.pairs, a.multi, a.scale, a.mode, a.fp16,
+               model_dir=a.model)
     elif a.cmd == "build":
         eng = a.engine or os.path.splitext(a.onnx)[0] + ".engine"
         build(a.onnx, eng, a.fp16)
     else:
-        bench(a.h, a.w, a.pairs, a.multi, a.iters)
+        bench(a.h, a.w, a.pairs, a.multi, a.iters, model_dir=a.model)
 
 
 if __name__ == "__main__":

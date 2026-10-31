@@ -15,6 +15,10 @@ RIFE 4.25 的高速插帧流水线：**NVDEC 解码 → RIFE 推理（TensorRT�
 同一台机器上 1080p 2x 长跑（3 万帧）稳定在 186 对/s；
 python 进程本身只占 **0.4~0.6 核**（1080p 2x），CPU 分析见 optimization.md §10。
 
+在 **双 RTX 3090**（本机，apt ffmpeg 4.4.2）上：720p 2x 单卡 **222 对/s**、双卡
+**384 对/s**（9600 帧，1.74×）；1080p 2x 单卡 **120 对/s**、双卡 **158 对/s**。
+详见 [`docs/multigpu_3090.md`](docs/multigpu_3090.md)。
+
 技术细节与所有实测数据见 [`docs/report.md`](docs/report.md)，
 做过但放弃的方案见 [`docs/experiments.md`](docs/experiments.md)，
 架构级分析（v1→v2 的四项改动、与 `vs-rife`/`vs-mlrt` 的机制对照、剩余空间）见
@@ -29,9 +33,9 @@ python 进程本身只占 **0.4~0.6 核**（1080p 2x），CPU 分析见 optimiza
 | 组件 | 要求 |
 |------|------|
 | Python | ≥ 3.10 |
-| GPU | NVIDIA RTX 20/30/40 系（需要 NVENC + NVDEC） |
+| GPU | NVIDIA RTX 20/30/40 系（需要 NVENC + NVDEC）；多卡用 `--gpus`，各卡独立工作 |
 | 驱动 | ≥ 525（能跑 CUDA 12.x 即可） |
-| ffmpeg | 系统安装，**必须带 nvenc**：`ffmpeg -encoders \| grep nvenc` |
+| ffmpeg | **系统 apt 安装**（`sudo apt install -y ffmpeg`），必须带 nvenc：`ffmpeg -encoders \| grep nvenc`；也可用 `FFMPEG=/path/to/bin` 指向静态包 |
 | 包管理 | [uv](https://docs.astral.sh/uv/)：`curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 
 ### 1.2 下载模型（必需）
@@ -62,12 +66,17 @@ models/
 ### 1.3 安装依赖
 
 ```bash
+# 系统 ffmpeg（Ubuntu/Debian 的 apt 包已带 NVENC；4.4.2 实测可用）
+sudo apt install -y ffmpeg
+ffmpeg -hide_banner -encoders | grep nvenc
+
 uv sync               # torch + TensorRT + ONNX + numpy + tqdm
-uv sync --extra png   # 额外装 opencv（validate / 画质对比等开发工具需要）
+# 注：validate / 画质对比工具用内置 PNG 解码（src/imgio.py），不再需要 opencv。
+# 旧文档里的 `uv sync --extra png` 现在只对你自己写的 cv2 脚本有意义。
 ```
 
 TensorRT 通过 pip 安装（`tensorrt` 包自带 CUDA 库），不需要另外装 NVIDIA 的 tarball。
-首次运行时会自动导出并构建 **两个** 引擎（Head + IFNet，约 2~4 分钟/分辨率×倍率）。
+首次运行时会自动导出并构建 **两个** 引擎（Head + IFNet，约 2~5 分钟/分辨率×倍率）。
 
 ---
 
@@ -75,14 +84,14 @@ TensorRT 通过 pip 安装（`tensorrt` 包自带 CUDA 库），不需要另外�
 
 ```bash
 # 720p 2x —— 默认就走 TensorRT，即实测最快的配置；输出到 out/in_2X.mp4
-# （首次跑某个 分辨率×倍率 组合会先建两个引擎，约 2~4 分钟，之后复用）
+# （首次跑某个 分辨率×倍率 组合会先建两个引擎，约 2~5 分钟，之后复用）
 uv run rife-fast -i in.mp4 -m 2 -o out
 
 # 多文件排队：按给出顺序逐个处理，输出到同一个文件夹
 uv run rife-fast -i a.mp4 b.mp4 c.mp4 -m 2 -o out
 uv run rife-fast -i a.mp4 -i b.mp4 -m 2 -o out      # 等价写法
 
-# 想对比纯 PyTorch 路径（慢 16%（720p）~26%（1080p））
+# 想对比纯 PyTorch 路径（慢 15~30%，3090 上约 30%）
 uv run rife-fast -i in.mp4 -m 2 --no-trt -o out
 
 # 4x / 8x
@@ -91,10 +100,32 @@ uv run rife-fast -i in.mp4 -m 8 -o out              # out/in_8X.mp4
 
 # 更小的文件
 uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o out
+
+# 多卡：共享任务队列；单视频自动分段，多视频按 auto 选 files/segments
+uv run rife-fast -i in.mp4 -m 2 -o out --gpus 0,1
+uv run rife-fast -i a.mp4 b.mp4 c.mp4 -m 2 -o out --gpus all
+uv run rife-fast -i a.mp4 b.mp4 c.mp4 -m 2 -o out --gpus all --gpu-strategy files
+
+# 同型号双卡想消除 TensorRT 跨卡 plan 警告：
+uv run rife-fast -i in.mp4 -m 2 -o out --gpus 0,1 --engine-per-gpu
 ```
 
 `-o` 是**输出文件夹**（默认当前目录），文件名自动追加倍率标志：
 `in.mp4` + `-m 2` → `in_2X.mp4`。
+
+多卡每卡一个子进程（独立 CUDA context / TRT 引擎 / CUDA Graph），共享 `flock` 任务队列：
+**完成当前任务后立刻领取下一个**，空闲卡自动补位；失败/被 kill 的任务只重试一次。
+
+| `--gpu-strategy auto` | 选择 |
+|---|---|
+| 1 个视频 | `segments`（短视频 1 段/卡，长视频 2 段/卡） |
+| ≥2 个，均衡，N 是卡数整数倍 | `files`（一卡一视频，无 part/concat） |
+| ≥2 个，N 不是卡数整数倍 | `segments`，按估时重新均分（等长时每视频 `ceil(N/G)` 段） |
+| ≥2 个，最长视频远超均值 | `segments`，只拆长视频 |
+
+分段无卡间数据搬运，父进程只做 `ffmpeg -f concat -c copy`；拼接帧数与单卡逐位一致
+（无损验证 99 dB / max 0）。2400 帧双文件 files：**24.8 s → 13.6 s（1.82×）**。
+有损编码下多卡码流不会与单卡逐字节相同（GOP 起点不同），插帧结果本身一致。
 
 `uv run rife-fast` 与 `uv run python -m src` 等价；如果你已 `uv sync`，
 也可以在 `.venv` 激活后用 `python -m src`。
@@ -112,9 +143,10 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o out
 | `-m, --multi` | 倍率 2/4/8（`--exp 3` 等价于 `-m 8`）；输出帧率 = 源帧率 × 倍率 |
 | `--codec` | `auto`（默认）：≤1080p 用 h264，>1080p 用 h265。也可强制 `h264`/`h265`/`x264`/`x265` |
 | `--quality`（别名 `--cq`） | 画质档 18–30，越小越清晰、文件越大。默认 **22** |
-| `--trt-engine` | **默认 `auto`**：按 分辨率/K/倍率/权重 自动找或建引擎；也可给基准路径 |
-| `--no-trt` | 关闭 TensorRT，走 PyTorch（慢 15~25%） |
+| `--trt-engine` | **默认 `auto`**：按 分辨率/K/倍率/权重/GPU 架构 自动找或建引擎；也可给基准路径 |
+| `--no-trt` | 关闭 TensorRT，走 PyTorch（慢 15~30%） |
 | `--no-audio` | 不合并音轨 |
+| `--gpus` | 多卡：`0,1` / `all`；共享任务队列，完成即取下一个（auto 按视频数/时长选 files/segments） |
 
 ### 3.2 高级参数（一般不用动）
 
@@ -128,9 +160,11 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto --quality 26 -o out
 | `--compile` | off | `torch.compile`（与 cudagraph 二选一） |
 | `--encoder` | auto | `nvenc` / `x264`（CPU）/ `null`（只测流水线不编码） |
 | `--nvenc-preset` `--tune` `--nvenc-bf` | 按 codec 自动 | 手动覆盖编码器档位 |
-| `--model` | `models/` | 权重目录（也可用环境变量 `RIFE_MODELS`） |
-| `--pad-mult` | 64 | H/W 向上对齐的倍数 |
-| `--bench --width --height --iters` | — | 只测模型吞吐，不读写视频 |
+| `--model` | `models/` | 权重目录（也可用环境变量 `RIFE_MODELS`）；引擎名带该目录权重的 md5 |
+| `--pad-mult` | 64 | H/W 向上对齐的倍数（减小会改画质，实测不建议） |
+| `--gpu-strategy` | auto | `auto` / `files` / `segments`（见 §2） |
+| `--engine-per-gpu` | 关 | 每张卡单独建/用 TRT 引擎（同型号双卡可消除跨卡 plan 警告） |
+| `--bench --width --height --iters` | — | 只测模型吞吐，不读写视频（单卡） |
 
 ### 3.3 画质档位怎么选
 
@@ -169,18 +203,25 @@ RIFE_FAST/
 ├── engines/           # TensorRT 引擎（自动生成，git 忽略）
 ├── assets/            # 自检用的两张示例图
 ├── src/
-│   ├── cli.py         # 命令行入口
+│   ├── cli.py         # 命令行入口 / 解码-推理-编码流水线
 │   ├── net.py         # 前向实现（ref / assemble / pyramid 三档）
 │   ├── engine.py      # ONNX 导出 / 引擎构建 / TRT 运行时
+│   ├── multigpu.py    # 多卡调度（共享任务队列 / 自动 files|segments / 拼接）
+│   ├── taskqueue.py   # flock 原子任务队列 + 每任务状态
+│   ├── _worker.py     # 每张卡一个子进程：领任务→复用 Runtime→写状态
+│   ├── ffmpeg_util.py # 定位 ffmpeg/ffprobe（FFMPEG 环境变量）
+│   ├── imgio.py       # 内置 PNG 读取（validate 不再依赖 opencv）
 │   ├── weights.py     # 权重与网络结构加载
 │   ├── validate.py    # 换权重后的数值自检
 │   ├── warplayer.py   # 反向 warp（与上游逐位一致）
 │   ├── IFNet_HDv3.py  # 内置网络结构（可被 models/ 里的同名文件覆盖）
 │   └── tools/         # 开发期工具（bench/profile/quality/...）
+├── tests/             # CPU-only 单元测试（调度/PNG）
 ├── docs/
-│   ├── report.md       # 性能报告与所有实测数据
-│   ├── experiments.md  # 已放弃方案的归档
-│   └── optimization.md # 架构级分析 + 上游对照 + 优化路线图
+│   ├── report.md         # 性能报告与所有实测数据
+│   ├── experiments.md    # 已放弃方案的归档
+│   ├── optimization.md   # 架构级分析 + 上游对照 + 优化路线图
+│   └── multigpu_3090.md  # 双 3090 适配、多卡设计与实测
 └── pyproject.toml
 ```
 
@@ -191,8 +232,10 @@ RIFE_FAST/
 > 当前内置/验证的是 **RIFE 4.25**（上游 README 推荐"大多数场景用 4.25"）。
 
 **TensorRT 引擎里烘焙了权重**，所以换 `flownet.pkl` 后必须重建引擎。
-本工具用**权重指纹**自动处理：引擎文件名带 `flownet.pkl` 的 md5 前 8 位，
-换权重后文件名自动变化，下次运行自动重建，不会误用旧引擎。
+本工具用**权重指纹**自动处理：引擎文件名带（`--model` 目录下）`flownet.pkl` 的 md5 前 8 位，
+换权重或换权重目录后文件名自动变化，下次运行自动重建，不会误用旧引擎。
+文件名还带 **GPU 架构 + TensorRT 版本**（如 `sm86_trt114`），4090（`sm89`）上建的引擎
+不会被 3090 误加载；换卡/升级 TRT 会自动重建。
 
 步骤：
 
@@ -218,7 +261,7 @@ uv run python -m src.validate
 再改 `src/net.py` 的对应分支。
 
 ```bash
-# 3) 直接跑，引擎自动重建（720p≈2min / 1080p≈4min）
+# 3) 直接跑，引擎自动重建（720p≈2~3min / 1080p≈3~5min，3090 实测偏慢）
 uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 ```
 
@@ -229,6 +272,31 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 **Q: 报 `flownet.pkl not found`？**
 见 §1.2，去 <https://github.com/hzwer/Practical-RIFE> 下载 4.25 的 `flownet.pkl` 放进 `models/`。
 
+**Q: 报 `ModuleNotFoundError: No module named 'cv2'`？**
+旧版本的 `validate.py` / 画质工具依赖 OpenCV（可选 extra）。现在这些入口改用
+`src/imgio.py` 的内置 PNG 解码，`uv sync` 后 `uv run python -m src.validate` 直接可跑。
+
+**Q: 报 `ffmpeg not found in PATH`？**
+优先用系统包（与 4090 环境一致）：`sudo apt install -y ffmpeg`，
+`ffmpeg -hide_banner -encoders | grep nvenc` 应有 `h264_nvenc` / `hevc_nvenc`。
+如果是自编译/静态包不在 PATH，再把它指给程序：
+`export FFMPEG=/path/to/ffmpeg/bin`（目录或二进制都可），`ffprobe` 会自动找同目录。
+
+**Q: 4090 上建的引擎能在 3090 上用吗？**
+不能（TensorRT plan 绑定 GPU 架构，见
+[NVIDIA 支持矩阵](https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/support-matrix.html)）。
+引擎文件名现在带 `sm89`/`sm86` 和 TRT 版本，换卡会自动重建；旧的无 tag 引擎会被忽略。
+
+**Q: 双卡跑时 TensorRT 警告 "Using an engine plan file across different models of devices"？**
+同架构的两张卡通常能共用 plan（实测可跑），但 NVIDIA 不保证。去掉警告/避免潜在性能损失：
+`--engine-per-gpu`（两卡各建一份，首次构建时间相近、磁盘占用翻倍），或设
+`RIFE_ENGINE_PER_GPU=1`。
+
+**Q: 双卡输出和单卡不完全一样？**
+插帧结果是一致的：用无损 x264 对比，单卡 vs 双卡分段 479 帧 **PSNR 99 dB、max|d|=0**。
+有损编码下每段从 IDR 开始、GOP 相位不同，码流和逐像素编码误差会不同；这是 NVENC 行为，
+不是分段错位（帧数/顺序已校验）。
+
 **Q: 输出文件太大？**
 默认 `--quality 22` 约 6 Mbps。改用 `--quality 26`（约 −32% 体积）或
 `--quality 30`。结束时会打印实际码率。
@@ -237,29 +305,27 @@ uv run rife-fast -i in.mp4 -m 2 --trt-engine auto -o out
 2K 用 `--batch-pairs 2`，4K 用 `--scale 0.5`。720p 2x 峰值约 **2.3 GiB**，
 8x（batch 7）约 **3.0 GiB**（Head 与 IFNet 各一份引擎 + 运行时激活）。
 
-**Q: 第一次跑某个分辨率/倍率为什么要等 2~4 分钟？**
-TensorRT 引擎是按 `(分辨率, K, 倍率, 权重)` 静态编译的，首次要导出 ONNX 并编译
-两个引擎（Head + IFNet），日志会打印 `[trt] ... not found, exporting + building`。
-之后同一个组合直接复用；换分辨率/倍率/权重会再建一份（旧的不会自动删）。
+**Q: 换分辨率/倍率/权重会重建引擎吗？**
+会。首次某个组合要 2~5 分钟（导出 ONNX + 编译 Head/IFNet），日志打印
+`[trt] ... not found, exporting + building`；之后复用。引擎绑定
+`(W,H,K,倍率,权重,GPU架构,TRT版本)`，改分辨率/倍率/`--batch-pairs` 都会重建
+（旧的不会自动删）。`--trt-engine auto` 自动处理。
 
 **Q: 输入是奇数分辨率（如 1279×719）？**
 4:2:0 表示不了奇数尺寸，会自动 pad 到偶数（1279×719 → 1280×720）并提示，
 输出也是填充后的尺寸。
 
-**Q: 换分辨率要重建引擎吗？**
-要，引擎绑定 `(W, H, batch)`。用 `--trt-engine auto` 会自动处理。
-注意**改 `--batch-pairs` 也会触发重建**。
-
 **Q: 多文件排队时会重复加载模型吗？**
 不会。同一分辨率/批次会复用模型、TRT 引擎和 CUDA Graph；
 只有分辨率或批次变化时才重建（显存只保留当前一份）。
+多卡时每个 worker 各自复用自己卡上的模型/引擎。
 
 **Q: 为什么 4x/8x 的输出 fps 和 2x 差不多？**
 流水线受"输出帧数"限制（编码器/IO），不是帧对数。倍率越高帧对/s 按比例下降。
 
 **Q: 能不能不用 TensorRT？**
 可以，加 `--no-trt` 就走 PyTorch（fp16 + CUDA Graph），实测端到端慢
-16%（720p：352 vs 305 对/s）~24%（1080p：183 vs 148）。
+15~30%（4090 720p：352 vs 305 对/s；3090 720p：169 vs 222 对/s）。
 TensorRT 是必需依赖，不需要时可从 `pyproject.toml` 删掉（那样就只能 `--no-trt`）。
 
 ---
@@ -272,10 +338,20 @@ uv run python -m src.tools.bench_gpu    # 各配置逐项对比
 uv run python -m src.tools.profile_gpu  # kernel 级瓶颈
 uv run python -m src.tools.model_cost   # FLOPs/访存成本模型
 uv run python -m src.tools.quality      # 画质 A/B
+uv run python -m src.tools.compare_pngs dir_a dir_b
 uv run python -m src.tools.compare_videos a.mp4 b.mp4 1280 720
+uv run python -m unittest discover -s tests -v   # CPU-only 调度/PNG 单元测试
 ```
 
-环境变量 `RIFE_STATS=1` 会打印流水线分段计时（read/pin/h2d/fwd/bufwait）。
+环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `RIFE_STATS=1` | 打印流水线分段计时（read/h2d/fwd/bufwait/gpu_fwd） |
+| `RIFE_PROGRESS=0` | 关闭进度条/周期进度行 |
+| `FFMPEG` / `FFPROBE` | ffmpeg/ffprobe 的二进制或目录（不在 PATH 时） |
+| `RIFE_MODELS` / `RIFE_ENGINES` | 覆盖权重/引擎目录 |
+| `RIFE_ENGINE_PER_GPU=1` | 等价于 `--engine-per-gpu` |
 
 ---
 

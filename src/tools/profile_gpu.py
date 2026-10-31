@@ -1,9 +1,9 @@
 """Where do the remaining milliseconds go?  Run this on the 4090.
 
-    uv run python -m src.profile_gpu
-    uv run python -m src.profile_gpu --mode pyramid --fp16
-    uv run python -m src.profile_gpu --channels-last
-    uv run python -m src.profile_gpu --compile reduce-overhead
+    uv run python -m src.tools.profile_gpu
+    uv run python -m src.tools.profile_gpu --mode pyramid --fp16
+    uv run python -m src.tools.profile_gpu --channels-last
+    uv run python -m src.tools.profile_gpu --compile reduce-overhead
 
 It prints
   1. the top CUDA kernels by self time, grouped into conv / warp / resize /

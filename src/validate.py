@@ -2,7 +2,7 @@
 
 Runs on CPU or CUDA and compares the fast paths against the stock forward:
 
-  warp     custom back-warp vs. warplayer                    (<=1e-5 in fp32)
+  warp     custom back-warp vs. warplayer                    (<=2e-5 in fp32)
   ref      IFNetFast(ref) vs. the stock RIFE_HDv3.inference   (must be 0.0)
   assemble vs. ref                                           (>=120 dB)
   pyramid  vs. ref                                           (>=40 dB)
@@ -10,15 +10,18 @@ Runs on CPU or CUDA and compares the fast paths against the stock forward:
   batch    batched vs. per-sample loop
 
 Usage:  uv run python -m src.validate
+
+Only the base dependencies are needed (PNG decoding uses ``src.imgio``, not
+OpenCV), so a plain ``uv sync`` is enough.
 """
 import os
 import time
 
-import cv2
 import numpy as np
 import torch
 
 from src import ROOT
+from src.imgio import read_png
 from src.net import interp, load_flownet, warp  # noqa: E402
 from src.warplayer import warp as warp_ref  # noqa: E402
 
@@ -41,8 +44,9 @@ DTYPE = torch.float16 if DEV.type == "cuda" else torch.float32
 
 def load_pair(a, b):
     def rd(p):
-        im = cv2.imread(os.path.join(ROOT, p), cv2.IMREAD_COLOR)[:, :, ::-1]
-        return torch.from_numpy(np.ascontiguousarray(im.transpose(2, 0, 1))).float()[None] / 255.0
+        im = read_png(os.path.join(ROOT, p))          # [H,W,3] uint8 RGB
+        return torch.from_numpy(
+            np.ascontiguousarray(im.transpose(2, 0, 1))).float()[None] / 255.0
 
     return rd(a).to(DEV), rd(b).to(DEV)
 
@@ -57,7 +61,8 @@ def main():
     x = torch.rand(2, 3, 64, 96, device=DEV)
     fl = (torch.rand(2, 2, 64, 96, device=DEV) - 0.5) * 20
     d = (warp(x, fl) - warp_ref(x, fl)).abs().max().item()
-    print(f"[warp]   max|fast-orig| = {d:.3e}  (fp32 CUDA is bit-exact; cpu/fp16 may differ)")
+    print(f"[warp]   max|fast-orig| = {d:.3e}  (fp32 CUDA: ~1e-5; "
+          f"cpu/fp16 may differ more)")
 
     # ---- 2. load both models -------------------------------------------
     # fold=False so that "ref" is literally the original arithmetic

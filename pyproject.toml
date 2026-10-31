@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# dev tools only (validate.py, quality.py, compare_pngs.py)
+# kept for backwards compatibility: nothing in the repo imports cv2 anymore
+# (validate/quality/compare_pngs use the stdlib PNG reader in src/imgio.py).
 png = ["opencv-python>=4.8"]
 
 [project.scripts]
